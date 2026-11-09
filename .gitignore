@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+.DS_Store
+.pytest_cache
+.ruff_cache
+
+/secrets/
+/requests.txt
