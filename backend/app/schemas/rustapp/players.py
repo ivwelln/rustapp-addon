@@ -1,5 +1,7 @@
 from pydantic import BaseModel, ConfigDict, Field
 
+from clients.rustapp.exceptions import RustAppError
+
 MAX_PLAYERS_PAGE_SIZE = 200
 
 class RustAppPlayer(BaseModel):
