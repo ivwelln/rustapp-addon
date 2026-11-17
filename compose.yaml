@@ -48,10 +48,27 @@ services:
       retries: 3
       start_period: 30s
     stop_grace_period: 30s
+  worker:
+    profiles: ["tools"]
+    image: rustapp-addon-backend:prod
+    build:
+      context: ./backend
+      target: prod
+    command: ["python", "-m", "app.workers.scan_players"]
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    secrets:
+      - app_rustapp_access_token
 
 secrets:
   postgres_password:
     file: ./secrets/postgres_password
+  app_rustapp_access_token:
+    file: ./secrets/app_rustapp_access_token
 
 volumes:
   pgdata:
