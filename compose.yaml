@@ -8,17 +8,44 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_DB: rustapp_addon
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
-    secrets: 
+    secrets:
       - postgres_password
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: 
+      test:
         - CMD-SHELL
         - pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$$POSTGRES_DB"
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 30s
+    stop_grace_period: 30s
+  api:
+    image: rustapp-addon-backend:prod
+    build:
+      context: ./backend
+      target: prod
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+    - "no-new-privileges:true"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"
+      interval: 10s
+      timeout: 3s
+      retries: 3
       start_period: 30s
     stop_grace_period: 30s
 

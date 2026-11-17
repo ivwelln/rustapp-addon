@@ -1,0 +1,23 @@
+services:
+  api:
+    image: rustapp-addon-backend:dev
+    build:
+      target: dev
+    restart: "no"
+    read_only: false
+    develop:
+      watch:
+        - action: sync
+          path: ./backend/app
+          target: /app/app
+          initial_sync: true
+
+        - action: rebuild
+          path: ./backend/pyproject.toml
+
+        - action: rebuild
+          path: ./backend/uv.lock
+
+        - action: rebuild
+          path: ./backend/Dockerfile
+
