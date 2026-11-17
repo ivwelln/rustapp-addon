@@ -18,5 +18,6 @@ class RustAppHTTPError(RustAppError):
         self.retry_after = retry_after
         super().__init__(f"RustApp вернул HTTP {status_code}")
 
+
 class RustAppResponseError(RustAppError):
     """RustApp вернул ответ неожиданного формата."""

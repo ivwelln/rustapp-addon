@@ -1,8 +1,9 @@
 from pydantic import ValidationError
 
-from app.clients.rustapp.client import create_rustapp_http_client, RustAppClient
+from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import RustAppResponseError
-from app.schemas.rustapp.players import RustAppPlayer, RustAppPlayersPage
+from app.schemas.rustapp.players import RustAppPlayersPage
+
 
 async def fetch_players_page(
     client: RustAppClient,
@@ -19,10 +20,10 @@ async def fetch_players_page(
             "only_vpn": False,
             "only_report_ignore": False,
             "only_with_comment": False,
-            "sort": "created_at"
+            "sort": "created_at",
         },
     )
-    
+
     try:
         return RustAppPlayersPage.model_validate_json(response.content)
     except ValidationError:
