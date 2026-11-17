@@ -3,8 +3,10 @@ name = "rustapp-addon-backend"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.163.1",
     "httpx2>=2.16.2",
     "pydantic-settings>=2.16.2",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [dependency-groups]
