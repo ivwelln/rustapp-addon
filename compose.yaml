@@ -22,10 +22,10 @@ services:
       start_period: 30s
     stop_grace_period: 30s
   api:
-    image: rustapp-addon-backend:local
+    image: rustapp-addon-backend:prod
     build:
       context: ./backend
-      target: dev
+      target: prod
     init: true
     restart: unless-stopped
     ports:
@@ -36,7 +36,7 @@ services:
     cap_drop:
       - ALL
     security_opt:
-    - "no-new-privileges: true"
+    - "no-new-privileges:true"
     healthcheck:
       test:
         - CMD
