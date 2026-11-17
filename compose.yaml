@@ -21,6 +21,33 @@ services:
       retries: 10
       start_period: 30s
     stop_grace_period: 30s
+  api:
+    image: rustapp-addon-backend:local
+    build:
+      context: ./backend
+      target: dev
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+    - "no-new-privileges: true"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 30s
 
 secrets:
   postgres_password:
