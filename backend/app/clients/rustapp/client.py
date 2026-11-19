@@ -10,13 +10,26 @@ from app.clients.rustapp.exceptions import (
 from app.core.config import Settings
 
 RUSTAPP_BASE_URL = httpx2.URL("https://court.rustapp.io")
+RUSTAPP_CORE_URL = httpx2.URL("https://core.rustapp.io")
+
+
+def _origin(url: httpx2.URL) -> tuple[str, str, int | None]:
+    return url.scheme, url.host, url.port
+
+
+_RUSTAPP_ORIGINS = {_origin(RUSTAPP_BASE_URL), _origin(RUSTAPP_CORE_URL)}
 
 
 def create_rustapp_http_client(
-    settings: Settings, *, transport: httpx2.AsyncBaseTransport | None = None
+    settings: Settings,
+    *,
+    transport: httpx2.AsyncBaseTransport | None = None,
+    base_url: httpx2.URL = RUSTAPP_BASE_URL,
 ) -> httpx2.AsyncClient:
+    if base_url not in (RUSTAPP_BASE_URL, RUSTAPP_CORE_URL):
+        raise ValueError("Недопустимый адрес RustApp")
     return httpx2.AsyncClient(
-        base_url=RUSTAPP_BASE_URL,
+        base_url=base_url,
         headers={
             "Authorization": f"Bearer {settings.rustapp_access_token.get_secret_value()}",
             "project-id": str(settings.rustapp_project_id),
@@ -32,6 +45,9 @@ def create_rustapp_http_client(
 
 class RustAppClient:
     def __init__(self, http: httpx2.AsyncClient) -> None:
+        self._expected_origin = _origin(http.base_url)
+        if self._expected_origin not in _RUSTAPP_ORIGINS or http.base_url.userinfo:
+            raise ValueError("Недопустимый адрес RustApp")
         self._http = http
 
     async def get(
@@ -42,13 +58,8 @@ class RustAppClient:
     ) -> httpx2.Response:
         request = self._http.build_request("GET", path, params=params)
 
-        if (
-            request.url.scheme != RUSTAPP_BASE_URL.scheme
-            or request.url.host != RUSTAPP_BASE_URL.host
-            or request.url.port != RUSTAPP_BASE_URL.port
-            or request.url.userinfo
-        ):
-            raise ValueError("Клиент допускает запросы только к https://court.rustapp.io")
+        if _origin(request.url) != self._expected_origin or request.url.userinfo:
+            raise ValueError("Запрос выходит за пределы адреса клента RustApp")
 
         try:
             response = await self._http.send(request, follow_redirects=False)
