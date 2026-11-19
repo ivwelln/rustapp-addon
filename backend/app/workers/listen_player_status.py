@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from collections import Counter
 
 from centrifuge import (
     CentrifugeError,
@@ -28,6 +27,7 @@ from app.clients.rustapp.handshake import fetch_centrifugo_token
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import get_settings
 from app.schemas.rustapp.realtime import RustAppPlayerStatusUpdate
+from app.services.rustapp.player_sessions import PlayerSessionTraker
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,11 @@ class ConnectionEvents(ClientEventHandler):
 class PlayerStatusEvents(SubscriptionEventHandler):
     def __init__(self, stopped: asyncio.Event) -> None:
         self._stopped = stopped
+        self._sessions = PlayerSessionTraker()
 
     async def on_subscribed(self, ctx: SubscribedContext) -> None:
+        if not ctx.recovered:
+            self._sessions.reset()
         logger.info("Подписка активна: %s", ctx.channel)
 
     async def on_unsubscribed(self, ctx: UnsubscribedContext) -> None:
@@ -68,8 +71,9 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             logger.warning("Неизвестный формат публикации статусов")
             return
 
-        counts = Counter(update.players.values())
-        logger.info("Статусы игроков: %s", update.players)
+        logger.debug("Статусы игроков: %s", update.players)
+        for steam_id in self._sessions.apply(update.players):
+            logger.info("Подтверждён заход  |  SteamID:  %s", steam_id)
 
 
 async def run_listener() -> int:
