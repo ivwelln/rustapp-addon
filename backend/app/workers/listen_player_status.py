@@ -10,6 +10,7 @@ from centrifuge import (
     ErrorContext,
     PublicationContext,
     SubscribedContext,
+    SubscribingContext,
     SubscriptionEventHandler,
     UnauthorizedError,
     UnsubscribedContext,
@@ -22,12 +23,14 @@ from app.clients.rustapp.client import (
     RustAppClient,
     create_rustapp_http_client,
 )
-from app.clients.rustapp.exceptions import RustAppHTTPError
+from app.clients.rustapp.exceptions import RustAppError, RustAppHTTPError, RustAppResponseError
 from app.clients.rustapp.handshake import fetch_centrifugo_token
+from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import get_settings
-from app.schemas.rustapp.realtime import RustAppPlayerStatusUpdate
-from app.services.rustapp.player_sessions import PlayerSessionTraker
+from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE
+from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
+from app.services.rustapp.player_sessions import PlayerSessionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -51,24 +54,83 @@ class ConnectionEvents(ClientEventHandler):
 
 
 class PlayerStatusEvents(SubscriptionEventHandler):
-    def __init__(self, stopped: asyncio.Event) -> None:
+    def __init__(
+        self,
+        stopped: asyncio.Event,
+        *,
+        court_client: RustAppClient,
+        project_id: int,
+        tasks: asyncio.TaskGroup,
+    ) -> None:
         self._stopped = stopped
-        self._sessions = PlayerSessionTraker()
+        self._sessions = PlayerSessionTracker()
+        self._court_client = court_client
+        self._project_id = project_id
+        self._tasks = tasks
+        self._pending_statuses: dict[str, PlayerStatus] | None = None
+        self._snapshot_task: asyncio.Task[None] | None = None
+
+    def cancel_snapshot(self) -> None:
+        if self._snapshot_task is not None:
+            self._snapshot_task.cancel()
+            self._snapshot_task = None
+
+    async def on_subscribing(self, ctx: SubscribingContext) -> None:
+        self.cancel_snapshot()
 
     async def on_subscribed(self, ctx: SubscribedContext) -> None:
-        if not ctx.recovered:
-            self._sessions.reset()
+        if not ctx.recovered or self._pending_statuses is not None:
+            self.cancel_snapshot()
+            pending: dict[str, PlayerStatus] = {}
+            self._pending_statuses = pending
+            self._snapshot_task = self._tasks.create_task(self._load_snapshot(pending))
         logger.info("Подписка активна: %s", ctx.channel)
 
     async def on_unsubscribed(self, ctx: UnsubscribedContext) -> None:
+        self.cancel_snapshot()
         logger.info("Подписка завершилась: %d", ctx.code)
         self._stopped.set()
+
+    async def _load_snapshot(self, pending: dict[str, PlayerStatus]) -> None:
+        snapshot: dict[str, PlayerStatus] = {}
+        loaded = False
+
+        try:
+            page = await fetch_players_page(self._court_client, page=0, limit=MAX_PLAYERS_PAGE_SIZE)
+            if page.page != 0:
+                raise RustAppResponseError("RustApp вернул страницу с неожиданным номером")
+            if any(player.project_id != self._project_id for player in page.results):
+                raise RustAppResponseError("RustApp вернул игроков из другого проекта")
+        except RustAppError as exc:
+            logger.warning("HTTP-сверка игроков не удалась: %s", exc)
+        else:
+            for player in page.results:
+                status = player.status
+                if status == "online" or status == "afk":
+                    snapshot[player.steam_id] = status
+
+            if len(page.results) >= page.limit:
+                logger.warning("Страница HTTP-сверки заполнена. Список может быть неполным.")
+            loaded = True
+
+        if self._snapshot_task is not asyncio.current_task():
+            return
+
+        self._sessions.seed(snapshot | pending)
+        self._pending_statuses = None
+        self._snapshot_task = None
+        if loaded:
+            logger.info("HTTP-сверка завершена | Игроков в снимке: %d", len(snapshot))
 
     async def on_publication(self, ctx: PublicationContext) -> None:
         try:
             update = RustAppPlayerStatusUpdate.model_validate(ctx.pub.data)
         except ValidationError:
             logger.warning("Неизвестный формат публикации статусов")
+            return
+
+        if self._pending_statuses is not None:
+            self._pending_statuses.update(update.players)
             return
 
         logger.debug("Статусы игроков: %s", update.players)
@@ -86,7 +148,11 @@ async def run_listener() -> int:
     stopped = asyncio.Event()
     channel = f"project:player-status/{settings.rustapp_project_id}"
 
-    async with create_rustapp_http_client(settings, base_url=RUSTAPP_CORE_URL) as http:
+    async with (
+        create_rustapp_http_client(settings, base_url=RUSTAPP_CORE_URL) as http,
+        create_rustapp_http_client(settings) as court_http,
+        asyncio.TaskGroup() as tasks,
+    ):
         core_client = RustAppClient(http)
 
         token_request_lock = asyncio.Lock()
@@ -133,7 +199,13 @@ async def run_listener() -> int:
             min_reconnect_delay=2.0,
             max_reconnect_delay=60.0,
         )
-        subscription = client.new_subscription(channel, events=PlayerStatusEvents(stopped))
+        status_events = PlayerStatusEvents(
+            stopped,
+            court_client=RustAppClient(court_http),
+            project_id=settings.rustapp_project_id,
+            tasks=tasks,
+        )
+        subscription = client.new_subscription(channel, events=status_events)
 
         try:
             await client.connect()
@@ -143,6 +215,7 @@ async def run_listener() -> int:
         except CentrifugeError as exc:
             logger.error("Слушатель RustApp завершился: %s", type(exc).__name__)
         finally:
+            status_events.cancel_snapshot()
             await client.disconnect()
 
     return 1

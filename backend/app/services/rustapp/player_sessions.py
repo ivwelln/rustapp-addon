@@ -3,7 +3,7 @@ from collections.abc import Mapping
 from app.schemas.rustapp.realtime import PlayerStatus
 
 
-class PlayerSessionTraker:
+class PlayerSessionTracker:
     def __init__(self) -> None:
         self._statuses: dict[str, PlayerStatus] = {}
 
@@ -20,3 +20,6 @@ class PlayerSessionTraker:
 
     def reset(self) -> None:
         self._statuses.clear()
+
+    def seed(self, statuses: Mapping[str, PlayerStatus]) -> None:
+        self._statuses = dict(statuses)
