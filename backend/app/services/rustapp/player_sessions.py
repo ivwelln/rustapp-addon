@@ -21,5 +21,6 @@ class PlayerSessionTracker:
     def reset(self) -> None:
         self._statuses.clear()
 
-    def seed(self, statuses: Mapping[str, PlayerStatus]) -> None:
-        self._statuses = dict(statuses)
+    def seed_missing(self, statuses: Mapping[str, PlayerStatus]) -> None:
+        for steam_id, status in statuses.items():
+            self._statuses.setdefault(steam_id, status)

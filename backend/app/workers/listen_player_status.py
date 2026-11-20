@@ -28,7 +28,7 @@ from app.clients.rustapp.handshake import fetch_centrifugo_token
 from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import get_settings
-from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE
+from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayersPage
 from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
 from app.services.rustapp.player_sessions import PlayerSessionTracker
 
@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 RUSTAPP_WS_URL = "wss://centrifugo.rustapp.io/connection/websocket"
 TOKEN_RETRY_FALLBACK_SECONDS = 300.0
+SNAPSHOT_RETRY_FALLBACK_SECONDS = 300.0
+SNAPSHOT_MIN_RETRY_SECONDS = 30.0
 
 
 class ConnectionEvents(ClientEventHandler):
@@ -67,7 +69,8 @@ class PlayerStatusEvents(SubscriptionEventHandler):
         self._court_client = court_client
         self._project_id = project_id
         self._tasks = tasks
-        self._pending_statuses: dict[str, PlayerStatus] | None = None
+        self._snapshot_loaded = False
+        self._snapshot_retry_not_before = 0.0
         self._snapshot_task: asyncio.Task[None] | None = None
 
     def cancel_snapshot(self) -> None:
@@ -79,11 +82,14 @@ class PlayerStatusEvents(SubscriptionEventHandler):
         self.cancel_snapshot()
 
     async def on_subscribed(self, ctx: SubscribedContext) -> None:
-        if not ctx.recovered or self._pending_statuses is not None:
+        if not ctx.recovered:
+            self._sessions.reset()
+            self._snapshot_loaded = False
+
+        if not self._snapshot_loaded:
             self.cancel_snapshot()
-            pending: dict[str, PlayerStatus] = {}
-            self._pending_statuses = pending
-            self._snapshot_task = self._tasks.create_task(self._load_snapshot(pending))
+            self._snapshot_task = self._tasks.create_task(self._load_snapshot())
+
         logger.info("Подписка активна: %s", ctx.channel)
 
     async def on_unsubscribed(self, ctx: UnsubscribedContext) -> None:
@@ -91,46 +97,71 @@ class PlayerStatusEvents(SubscriptionEventHandler):
         logger.info("Подписка завершилась: %d", ctx.code)
         self._stopped.set()
 
-    async def _load_snapshot(self, pending: dict[str, PlayerStatus]) -> None:
-        snapshot: dict[str, PlayerStatus] = {}
-        loaded = False
+    async def _load_snapshot(self) -> None:
+        task = asyncio.current_task()
+        loop = asyncio.get_running_loop()
 
         try:
-            page = await fetch_players_page(self._court_client, page=0, limit=MAX_PLAYERS_PAGE_SIZE)
-            if page.page != 0:
-                raise RustAppResponseError("RustApp вернул страницу с неожиданным номером")
-            if any(player.project_id != self._project_id for player in page.results):
-                raise RustAppResponseError("RustApp вернул игроков из другого проекта")
+            while self._snapshot_task is task:
+                remaining = self._snapshot_retry_not_before - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+
+                try:
+                    page = await fetch_players_page(
+                        self._court_client, page=0, limit=MAX_PLAYERS_PAGE_SIZE
+                    )
+                except RustAppHTTPError as exc:
+                    if self._snapshot_task is not task:
+                        return
+                    if exc.status_code != 429 and (
+                        exc.status_code != 503 or exc.retry_after is None
+                    ):
+                        raise
+
+                    delay = parse_retry_after(exc.retry_after)
+                    if delay is None:
+                        delay = SNAPSHOT_RETRY_FALLBACK_SECONDS
+                    delay = max(SNAPSHOT_MIN_RETRY_SECONDS, delay)
+                    self._snapshot_retry_not_before = loop.time() + delay
+                    logger.warning("HTTP-сверка: HTTP %d. Пауза %.1f с.", exc.status_code, delay)
+                    continue
+
+                if self._snapshot_task is task:
+                    self._apply_snapshot(page)
+                return
         except RustAppError as exc:
-            logger.warning("HTTP-сверка игроков не удалась: %s", exc)
-        else:
-            for player in page.results:
-                status = player.status
-                if status == "online" or status == "afk":
-                    snapshot[player.steam_id] = status
+            if self._snapshot_task is task:
+                logger.warning("HTTP-сверка игроков не удалась: %s", exc)
+        finally:
+            if self._snapshot_task is task:
+                self._snapshot_task = None
 
-            if len(page.results) >= page.limit:
-                logger.warning("Страница HTTP-сверки заполнена. Список может быть неполным.")
-            loaded = True
+    def _apply_snapshot(self, page: RustAppPlayersPage) -> None:
+        if page.page != 0:
+            raise RustAppResponseError("RustApp вернул страницу с неожиданным номером")
+        if any(player.project_id != self._project_id for player in page.results):
+            raise RustAppResponseError("RustApp вернул игроков из другого проекта")
 
-        if self._snapshot_task is not asyncio.current_task():
-            return
+        snapshot: dict[str, PlayerStatus] = {}
+        for player in page.results:
+            status = player.status
+            if status == "online" or status == "afk":
+                snapshot[player.steam_id] = status
 
-        self._sessions.seed(snapshot | pending)
-        self._pending_statuses = None
-        self._snapshot_task = None
-        if loaded:
-            logger.info("HTTP-сверка завершена | Игроков в снимке: %d", len(snapshot))
+        if len(page.results) >= page.limit:
+            logger.warning("Страница HTTP-сверки заполнена. Список может быть неполным.")
+
+        self._sessions.seed_missing(snapshot)
+        self._snapshot_loaded = True
+        logger.info("HTTP-сверка завершена | Игроков в снимке: %d", len(snapshot))
 
     async def on_publication(self, ctx: PublicationContext) -> None:
         try:
             update = RustAppPlayerStatusUpdate.model_validate(ctx.pub.data)
         except ValidationError:
             logger.warning("Неизвестный формат публикации статусов")
-            return
-
-        if self._pending_statuses is not None:
-            self._pending_statuses.update(update.players)
             return
 
         logger.debug("Статусы игроков: %s", update.players)
