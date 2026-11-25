@@ -73,7 +73,7 @@ async def test_afk_pauses_requests_and_online_wakes_existing_job():
                 assert eligible is None
                 job = await db.get(CollectionJob, (project, steam_id))
                 await collect(db, client, job, ModerationSettings())
-                job.due_at = now_ms() + 90_000
+                job.due_at = now_ms() + ModerationSettings().poll_seconds * 1000
 
             await listener._update_presence(
                 {steam_id: "online", startup_afk: "online"}, observed + 1
