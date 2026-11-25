@@ -47,6 +47,8 @@ services:
       timeout: 3s
       retries: 3
       start_period: 30s
+    secrets:
+      - app_db_password
     stop_grace_period: 30s
   worker:
     profiles: ["tools"]
