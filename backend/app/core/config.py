@@ -54,7 +54,7 @@ class ModerationSettings(BaseSettings):
     server_id: int = Field(default=163, gt=0)
     enforce: bool = False
     ban_guard_url: str = "http://ban-guard:8000"
-    poll_seconds: int = Field(default=60, ge=1)
+    poll_seconds: int = Field(default=90, ge=1)
     initial_ban_pages: int = Field(default=1, ge=1)
     request_interval: float = Field(default=1.0, gt=0)
     patterns: Patterns = Patterns()

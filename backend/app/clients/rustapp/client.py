@@ -1,4 +1,6 @@
+import logging
 from collections.abc import Mapping
+from time import perf_counter
 
 import httpx2
 from sqlalchemy.exc import SQLAlchemyError
@@ -11,6 +13,8 @@ from app.clients.rustapp.exceptions import (
 )
 from app.core.config import Settings
 from app.crud.rustapp_requests import record_request
+
+logger = logging.getLogger(__name__)
 
 RUSTAPP_BASE_URL = httpx2.URL("https://court.rustapp.io")
 RUSTAPP_CORE_URL = httpx2.URL("https://core.rustapp.io")
@@ -75,17 +79,36 @@ class RustAppClient:
         return await self._send(request)
 
     async def _send(self, request: httpx2.Request) -> httpx2.Response:
-
         if _origin(request.url) != self._expected_origin or request.url.userinfo:
             raise ValueError("Запрос выходит за пределы адреса клента RustApp")
 
+        method, path = request.method, request.url.path
+        started = perf_counter()
+        logger.debug("RustApp: отправка %s %s", method, path)
         try:
             response = await self._http.send(request, follow_redirects=False)
         except httpx2.TimeoutException:
+            logger.warning(
+                "RustApp: тайм-аут %s %s | %.0f мс", method, path, (perf_counter() - started) * 1000
+            )
             raise RustAppTimeoutError("Истекло время ожидания ответа от RustApp") from None
-        except httpx2.RequestError:
+        except httpx2.RequestError as exc:
+            logger.warning(
+                "RustApp: ошибка транспорта %s %s | %s", method, path, type(exc).__name__
+            )
             raise RustAppTransportError("Не удалось выполнить запрос к RustApp") from None
+        except RustAppTransportError:
+            logger.warning("RustApp: запрос %s %s остановлен при записи в PostgreSQL", method, path)
+            raise
 
+        logger.log(
+            logging.INFO if response.is_success else logging.WARNING,
+            "RustApp: %s %s | HTTP %d | %.0f мс",
+            method,
+            path,
+            response.status_code,
+            (perf_counter() - started) * 1000,
+        )
         if not response.is_success:
             raise RustAppHTTPError(
                 response.status_code,

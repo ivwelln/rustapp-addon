@@ -38,6 +38,12 @@ async def enqueue(db: AsyncSession, project: int, players: Iterable[str], *, see
         for sid in steam_ids
         if sid not in trusted
     ]
+    logger.debug(
+        "PostgreSQL: очередь игроков | проект=%d кандидатов=%d пропущено по белому списку=%d",
+        project,
+        len(values),
+        len(trusted),
+    )
     if not values:
         return
     stmt = insert(CollectionJob).values(values)
@@ -193,3 +199,10 @@ async def save_decision(
         and matches.keys() - previous.keys()
     ):
         decision.state = "pending"
+        await db.flush()
+        logger.info(
+            "Модерация: решение поставлено в очередь | решение=%s SteamID=%s паттерн=%s",
+            decision.id,
+            session.steam_id,
+            decision.primary_pattern,
+        )

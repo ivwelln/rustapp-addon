@@ -61,6 +61,8 @@ services:
       - ALL
     security_opt:
       - "no-new-privileges:true"
+    environment:
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
     depends_on:
       db:
         condition: service_healthy
@@ -80,6 +82,8 @@ services:
       - ALL
     security_opt:
       - "no-new-privileges:true"
+    environment:
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
     depends_on:
       db:
         condition: service_healthy
@@ -100,6 +104,8 @@ services:
       - ALL
     security_opt:
       - "no-new-privileges:true"
+    environment:
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
     depends_on:
       db:
         condition: service_healthy
@@ -129,6 +135,7 @@ services:
     security_opt:
       - "no-new-privileges:true"
     environment:
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
       APP_MODERATION_INITIAL_BAN_PAGES:
       APP_MODERATION_REQUEST_INTERVAL:
       APP_MODERATION_POLL_SECONDS:

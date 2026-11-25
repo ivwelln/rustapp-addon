@@ -1,3 +1,4 @@
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -15,6 +16,8 @@ from app.models import CollectionJob, CombatKill, PlayerData
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, YEAR_MS, played_ms
+
+logger = logging.getLogger(__name__)
 
 SESSION_PAGE_SIZE = 20
 JOIN_DATA_TTL = 10 * MINUTE
@@ -132,6 +135,7 @@ async def collect(
     project, sid = job.project_id, job.steam_id
     if await whitelisted(db, project, sid, lock=True):
         job.due_at = None
+        logger.debug("Модерация: пропуск по белому списку | SteamID=%s", sid)
         return
     fresh = job.collected_at is None or job.requested_at > job.collected_at
     records, session_data = await fetch_sessions(client, project, sid)
@@ -142,6 +146,7 @@ async def collect(
     is_licensed = await cache_sessions(db, project, sid, session_data)
     now = now_ms()
     if is_licensed:
+        logger.info("Белый список: добавлен игрок по лицензии | SteamID=%s", sid)
         job.collected_at, job.due_at = now, None
         return
     if await collect_playtime(
@@ -154,6 +159,7 @@ async def collect(
         now=now,
     ):
         await whitelist_for_playtime(db, project, sid)
+        logger.info("Белый список: подтверждены лицензия или игровое время | SteamID=%s", sid)
         job.collected_at, job.due_at = now, None
         return
     player_data = await db.get(PlayerData, (project, sid))
@@ -166,10 +172,12 @@ async def collect(
     if last_profile is None or (fresh and needs_refresh("details")):
         profile, data = await fetch_profile(client, project, sid)
         if await cache_profile(db, project, sid, data):
+            logger.info("Белый список: добавлен игрок по лицензии из профиля | SteamID=%s", sid)
             job.collected_at, job.due_at = now, None
             return
     else:
         profile = Profile.model_validate(last_profile["player"])
+        logger.debug("PostgreSQL: профиль использован из кэша | SteamID=%s", sid)
     now = now_ms()
     base = f"/players/{sid}/"
     eligible = [
@@ -260,6 +268,7 @@ async def collect(
         else None
     )
     if not current:
+        logger.debug("Модерация: сессия на сервере наблюдения не найдена | SteamID=%s", sid)
         return
     kind = {True: "licensed", False: "pirated", None: "unknown"}[current.is_license]
 
@@ -270,6 +279,11 @@ async def collect(
         observed_at=datetime.fromtimestamp(current.connected_at / 1000, UTC),
     )
     if current.is_license is not False or current.joined_at is None:
+        logger.debug(
+            "Модерация: пропуск без подтверждённой пиратской игровой сессии | SteamID=%s клиент=%s",
+            sid,
+            kind,
+        )
         return
     # A delayed final poll may still archive the evidence, but never dispatch for a closed session.
     if not active and (current.disconnected_at or 0) < job.requested_at:
@@ -326,4 +340,10 @@ async def collect(
             replace(facts, at=kill.created_at), rules, entry=False
         ).items():
             matches.setdefault(code, result)
+    logger.debug(
+        "Модерация: паттерны проверены | SteamID=%s убийств=%d совпадения=%s",
+        sid,
+        len(kills),
+        ", ".join(sorted(matches)) or "нет",
+    )
     await save_decision(db, current, matches, enforce=settings.enforce and active)

@@ -15,6 +15,7 @@ from app.clients.rustapp.exceptions import (
 from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, Settings, get_settings
+from app.core.logging import configure_console_logging
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayersPage
 
@@ -100,7 +101,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    configure_console_logging()
     try:
         return asyncio.run(run_worker(continuous=args.loop))
     except KeyboardInterrupt:

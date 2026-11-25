@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.routes.health import router as health_router
 from app.ban_guard.quota import BAN_LIMIT, claim, slots_used
 from app.core.config import DatabaseSettings
+from app.core.logging import configure_console_logging
 from app.db.session import open_database_sessions
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class Permit(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_console_logging()
     async with open_database_sessions(DatabaseSettings()) as sessions:
         app.state.sessions = sessions
         yield

@@ -31,6 +31,7 @@ from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.realtime import RustAppRealtimeClient
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, get_settings
+from app.core.logging import configure_console_logging
 from app.crud.moderation import enqueue
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer, RustAppPlayersPage
@@ -212,7 +213,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             logger.warning("Неизвестный формат публикации статусов")
             return
 
-        logger.debug("Статусы игроков: %s", update.players)
+        logger.debug("RustApp WebSocket: получены статусы | игроков=%d", len(update.players))
         joined = self._sessions.apply(update.players)
         if joined:
             await self._enqueue_players(joined, seed=False)
@@ -315,7 +316,7 @@ async def run_listener() -> int:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    configure_console_logging()
     try:
         raise SystemExit(asyncio.run(run_listener()))
     except KeyboardInterrupt:
