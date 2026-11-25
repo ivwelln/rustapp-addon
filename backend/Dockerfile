@@ -49,6 +49,8 @@ FROM base AS prod
 
 COPY --from=builder /app/.venv /app/.venv
 COPY app ./app
+COPY alembic.ini ./
+COPY migrations ./migrations
 
 USER app:app
 
