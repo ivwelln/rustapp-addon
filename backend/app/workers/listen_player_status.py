@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 from centrifuge import (
     CentrifugeError,
@@ -17,6 +18,8 @@ from centrifuge import (
 )
 from pydantic import ValidationError
 from pydantic_settings import SettingsError
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.clients.rustapp.client import (
     RUSTAPP_CORE_URL,
@@ -27,10 +30,12 @@ from app.clients.rustapp.exceptions import RustAppError, RustAppHTTPError, RustA
 from app.clients.rustapp.handshake import fetch_centrifugo_token
 from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.retry_after import parse_retry_after
-from app.core.config import get_settings
-from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayersPage
+from app.core.config import DatabaseSettings, get_settings
+from app.db.session import open_database_sessions
+from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer, RustAppPlayersPage
 from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
 from app.services.rustapp.player_sessions import PlayerSessionTracker
+from app.services.rustapp.player_snapshots import save_player_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,7 @@ RUSTAPP_WS_URL = "wss://centrifugo.rustapp.io/connection/websocket"
 TOKEN_RETRY_FALLBACK_SECONDS = 300.0
 SNAPSHOT_RETRY_FALLBACK_SECONDS = 300.0
 SNAPSHOT_MIN_RETRY_SECONDS = 30.0
+SNAPSHOT_DB_RETRY_SECONDS = 30
 
 
 class ConnectionEvents(ClientEventHandler):
@@ -61,12 +67,14 @@ class PlayerStatusEvents(SubscriptionEventHandler):
         stopped: asyncio.Event,
         *,
         court_client: RustAppClient,
+        db_sessions: async_sessionmaker[AsyncSession],
         project_id: int,
         tasks: asyncio.TaskGroup,
     ) -> None:
         self._stopped = stopped
         self._sessions = PlayerSessionTracker()
         self._court_client = court_client
+        self._db_sessions = db_sessions
         self._project_id = project_id
         self._tasks = tasks
         self._snapshot_loaded = False
@@ -108,6 +116,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                     await asyncio.sleep(remaining)
                     continue
 
+                observed_at = datetime.now(UTC)
                 try:
                     page = await fetch_players_page(
                         self._court_client, page=0, limit=MAX_PLAYERS_PAGE_SIZE
@@ -129,7 +138,9 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                     continue
 
                 if self._snapshot_task is task:
-                    self._apply_snapshot(page)
+                    players = self._apply_snapshot(page)
+                    await self._persist_snapshot(players, observed_at=observed_at)
+                    self._snapshot_loaded = True
                 return
         except RustAppError as exc:
             if self._snapshot_task is task:
@@ -138,24 +149,48 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             if self._snapshot_task is task:
                 self._snapshot_task = None
 
-    def _apply_snapshot(self, page: RustAppPlayersPage) -> None:
+    def _apply_snapshot(self, page: RustAppPlayersPage) -> list[RustAppPlayer]:
         if page.page != 0:
             raise RustAppResponseError("RustApp вернул страницу с неожиданным номером")
         if any(player.project_id != self._project_id for player in page.results):
             raise RustAppResponseError("RustApp вернул игроков из другого проекта")
 
         snapshot: dict[str, PlayerStatus] = {}
+        players: list[RustAppPlayer] = []
         for player in page.results:
             status = player.status
             if status == "online" or status == "afk":
                 snapshot[player.steam_id] = status
+                players.append(player)
 
         if len(page.results) >= page.limit:
             logger.warning("Страница HTTP-сверки заполнена. Список может быть неполным.")
 
         self._sessions.seed_missing(snapshot)
-        self._snapshot_loaded = True
         logger.info("HTTP-сверка завершена | Игроков в снимке: %d", len(snapshot))
+        return players
+
+    async def _persist_snapshot(
+        self, players: list[RustAppPlayer], *, observed_at: datetime
+    ) -> None:
+        while True:
+            try:
+                count = await save_player_snapshot(
+                    self._db_sessions,
+                    project_id=self._project_id,
+                    players=players,
+                    observed_at=observed_at,
+                )
+            except (OSError, SQLAlchemyError) as exc:
+                logger.warning(
+                    "Запись снимка в PostgreSQL не удалась (%s). Повтор через %d с.",
+                    type(exc).__name__,
+                    SNAPSHOT_DB_RETRY_SECONDS,
+                )
+                await asyncio.sleep(SNAPSHOT_DB_RETRY_SECONDS)
+            else:
+                logger.info("Снимок обработан в PostgreSQL | Игроков: %d", count)
+                return
 
     async def on_publication(self, ctx: PublicationContext) -> None:
         try:
@@ -176,12 +211,19 @@ async def run_listener() -> int:
         logger.info("Не удалось загрузить настройки RustApp")
         return 1
 
+    try:
+        database_settings = DatabaseSettings()
+    except (SettingsError, ValidationError):
+        logger.error("Не удалось загрузить настройки PostgreSQL")
+        return 1
+
     stopped = asyncio.Event()
     channel = f"project:player-status/{settings.rustapp_project_id}"
 
     async with (
         create_rustapp_http_client(settings, base_url=RUSTAPP_CORE_URL) as http,
         create_rustapp_http_client(settings) as court_http,
+        open_database_sessions(database_settings) as db_sessions,
         asyncio.TaskGroup() as tasks,
     ):
         core_client = RustAppClient(http)
@@ -233,6 +275,7 @@ async def run_listener() -> int:
         status_events = PlayerStatusEvents(
             stopped,
             court_client=RustAppClient(court_http),
+            db_sessions=db_sessions,
             project_id=settings.rustapp_project_id,
             tasks=tasks,
         )

@@ -63,6 +63,25 @@ services:
       - "no-new-privileges:true"
     secrets:
       - app_rustapp_access_token
+  listener:
+    profiles: ["tools"]
+    image: rustapp-addon-backend:prod
+    build:
+      context: ./backend
+      target: prod
+    command: ["python", "-m", "app.workers.listen_player_status"]
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      db:
+        condition: service_healthy
+    secrets:
+      - app_rustapp_access_token
+      - app_db_password
   migrate:
     profiles: ["tools"]
     image: rustapp-addon-backend:prod
