@@ -6,7 +6,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.crud.player_data import save_response
 from app.models.moderation import CollectionJob, CombatKill, Decision, Observation, ReferenceBan
+from app.models.player import Player
 from app.services.moderation.evaluate import describe, outcome
 from app.services.moderation.facts import MINUTE, Ban, Kill, Patterns, Session
 
@@ -19,9 +21,22 @@ def now_ms() -> int:
 
 async def enqueue(db: AsyncSession, project: int, players: Iterable[str], *, seed: bool) -> None:
     at = now_ms()
+    steam_ids = sorted(set(players))
+    if not steam_ids:
+        return
+    trusted = set(
+        await db.scalars(
+            select(Player.steam_id).where(
+                Player.project_id == project,
+                Player.steam_id.in_(steam_ids),
+                Player.is_whitelisted,
+            )
+        )
+    )
     values = [
         dict(project_id=project, steam_id=sid, requested_at=at, due_at=at)
-        for sid in sorted(set(players))
+        for sid in steam_ids
+        if sid not in trusted
     ]
     if not values:
         return
@@ -48,16 +63,24 @@ async def latest(db: AsyncSession, project: int, sid: str, source: str) -> Obser
 
 
 async def archive(db: AsyncSession, project: int, sid: str, source: str, data: dict) -> None:
+    observed_at = now_ms()
+    await save_response(db, project, sid, source, observed_at, data)
     last = await latest(db, project, sid, source)
     if last is None or last.payload != data:
         db.add(
             Observation(
-                project_id=project, steam_id=sid, source=source, observed_at=now_ms(), payload=data
+                project_id=project,
+                steam_id=sid,
+                source=source,
+                observed_at=observed_at,
+                payload=data,
             )
         )
 
 
-async def save_kill(db: AsyncSession, project: int, server: int, sid: str, kill: Kill) -> None:
+async def save_kill(
+    db: AsyncSession, project: int, server: int, sid: str, kill: Kill, payload: dict
+) -> None:
     stmt = insert(CombatKill).values(
         project_id=project,
         server_id=server,
@@ -65,12 +88,16 @@ async def save_kill(db: AsyncSession, project: int, server: int, sid: str, kill:
         event_id=kill.id,
         at=kill.created_at,
         facts=kill.model_dump(),
+        payload=payload,
     )
     await db.execute(
         stmt.on_conflict_do_update(
             index_elements=["project_id", "event_id"],
-            set_={"facts": stmt.excluded.facts},
-            where=CombatKill.facts != stmt.excluded.facts,
+            set_={"facts": stmt.excluded.facts, "payload": stmt.excluded.payload},
+            where=or_(
+                CombatKill.payload.is_distinct_from(stmt.excluded.payload),
+                CombatKill.facts.is_distinct_from(stmt.excluded.facts),
+            ),
         )
     )
 
@@ -83,11 +110,21 @@ async def reference_bans(
     if signed_at is not None:
         width = rules.P01.tolerance_seconds * 1000
         query = or_(query, ReferenceBan.signed_at.between(signed_at - width, signed_at + width))
+    trusted = (
+        select(Player.steam_id)
+        .where(
+            Player.project_id == ReferenceBan.project_id,
+            Player.steam_id == ReferenceBan.steam_id,
+            Player.is_whitelisted,
+        )
+        .exists()
+    )
     records = await db.scalars(
         select(ReferenceBan)
         .where(
             ReferenceBan.project_id == project,
             ReferenceBan.eligible,
+            ~trusted,
             ReferenceBan.steam_id != session.steam_id,
             query,
         )

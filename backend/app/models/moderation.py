@@ -11,6 +11,7 @@ class CollectionJob(Base):
     steam_id: Mapped[str] = mapped_column(Text, primary_key=True)
     requested_at: Mapped[int] = mapped_column(BigInteger)
     collected_at: Mapped[int | None] = mapped_column(BigInteger)
+    session_history_covered_at: Mapped[int | None] = mapped_column(BigInteger)
     due_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
 
 
@@ -33,6 +34,7 @@ class CombatKill(Base):
     steam_id: Mapped[str] = mapped_column(Text)
     at: Mapped[int] = mapped_column(BigInteger)
     facts: Mapped[dict] = mapped_column(JSONB)
+    payload: Mapped[dict | None] = mapped_column(JSONB)
     __table_args__ = (Index("ix_kill_window", "project_id", "steam_id", "server_id", "at"),)
 
 

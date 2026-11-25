@@ -4,7 +4,7 @@ MAX_PLAYERS_PAGE_SIZE = 200
 
 
 class RustAppPlayer(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="allow")
 
     steam_id: str = Field(min_length=1)
     project_id: int = Field(gt=0)
