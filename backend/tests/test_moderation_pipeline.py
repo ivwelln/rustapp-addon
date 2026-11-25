@@ -10,6 +10,8 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.ban_guard.api import app as ban_guard_api
+from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import RustAppTimeoutError
 from app.core.config import ModerationSettings, Settings
@@ -105,10 +107,15 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
     sessions = async_sessionmaker(engine)
     config = Settings(rustapp_access_token="test", rustapp_project_id=project)
     settings = ModerationSettings(enforce=outcome != "observe")
+    ban_guard_api.state.sessions = sessions
     try:
-        async with create_rustapp_http_client(
-            config, transport=httpx2.MockTransport(handle)
-        ) as http:
+        async with (
+            create_rustapp_http_client(config, transport=httpx2.MockTransport(handle)) as http,
+            httpx2.AsyncClient(
+                base_url="http://ban-guard", transport=httpx2.ASGITransport(app=ban_guard_api)
+            ) as guard_http,
+        ):
+            guard = BanGuard(guard_http, project)
             client = RustAppClient(http)
             async with sessions.begin() as db:
                 await enqueue(db, project, [sid, sid], seed=False)
@@ -141,7 +148,7 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     if observation.source == "checks"
                 ) == {"total": 5}
             if outcome in {"missing_ip", "already_banned", "observe"}:
-                await deliver(sessions, client, project, settings)
+                await deliver(sessions, client, project, settings, guard)
                 expected = {
                     "missing_ip": "failed",
                     "already_banned": "superseded",
@@ -155,10 +162,10 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                 assert "Блокировка подтверждена" not in caplog.text
                 return
             with pytest.raises(RustAppTimeoutError):
-                await deliver(sessions, client, project, settings)
+                await deliver(sessions, client, project, settings, guard)
             assert "Отправка бессрочного бана" in caplog.text
             assert "Блокировка подтверждена" not in caplog.text
-            await deliver(sessions, client, project, settings)
+            await deliver(sessions, client, project, settings, guard)
             async with sessions.begin() as db:
                 await reconcile(db, client, project, 163)
                 await sync_bans(db, client, project)

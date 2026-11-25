@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 
 from centrifuge import (
     CentrifugeError,
-    Client,
     ClientEventHandler,
     ConnectingContext,
     DisconnectedContext,
@@ -29,6 +28,7 @@ from app.clients.rustapp.client import (
 from app.clients.rustapp.exceptions import RustAppError, RustAppHTTPError, RustAppResponseError
 from app.clients.rustapp.handshake import fetch_centrifugo_token
 from app.clients.rustapp.players import fetch_players_page
+from app.clients.rustapp.realtime import RustAppRealtimeClient
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, get_settings
 from app.crud.moderation import enqueue
@@ -237,9 +237,11 @@ async def run_listener() -> int:
     channel = f"project:player-status/{settings.rustapp_project_id}"
 
     async with (
-        create_rustapp_http_client(settings, base_url=RUSTAPP_CORE_URL) as http,
-        create_rustapp_http_client(settings) as court_http,
         open_database_sessions(database_settings) as db_sessions,
+        create_rustapp_http_client(
+            settings, base_url=RUSTAPP_CORE_URL, request_log=db_sessions
+        ) as http,
+        create_rustapp_http_client(settings, request_log=db_sessions) as court_http,
         asyncio.TaskGroup() as tasks,
     ):
         core_client = RustAppClient(http)
@@ -279,8 +281,9 @@ async def run_listener() -> int:
                     raise
 
         # WebSocket Client
-        client = Client(
+        client = RustAppRealtimeClient(
             RUSTAPP_WS_URL,
+            request_log=db_sessions,
             events=ConnectionEvents(stopped),
             get_token=get_token,
             headers={"Origin": "https://rustapp.io"},

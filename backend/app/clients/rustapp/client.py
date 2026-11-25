@@ -1,6 +1,8 @@
 from collections.abc import Mapping
 
 import httpx2
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.clients.rustapp.exceptions import (
     RustAppHTTPError,
@@ -8,6 +10,7 @@ from app.clients.rustapp.exceptions import (
     RustAppTransportError,
 )
 from app.core.config import Settings
+from app.crud.rustapp_requests import record_request
 
 RUSTAPP_BASE_URL = httpx2.URL("https://court.rustapp.io")
 RUSTAPP_CORE_URL = httpx2.URL("https://core.rustapp.io")
@@ -25,9 +28,17 @@ def create_rustapp_http_client(
     *,
     transport: httpx2.AsyncBaseTransport | None = None,
     base_url: httpx2.URL = RUSTAPP_BASE_URL,
+    request_log: async_sessionmaker[AsyncSession] | None = None,
 ) -> httpx2.AsyncClient:
     if base_url not in (RUSTAPP_BASE_URL, RUSTAPP_CORE_URL):
         raise ValueError("Недопустимый адрес RustApp")
+
+    async def record(_request: httpx2.Request) -> None:
+        try:
+            await record_request(request_log)
+        except (SQLAlchemyError, OSError) as exc:
+            raise RustAppTransportError("Не удалось записать время запроса RustApp") from exc
+
     return httpx2.AsyncClient(
         base_url=base_url,
         headers={
@@ -40,6 +51,7 @@ def create_rustapp_http_client(
         follow_redirects=False,
         trust_env=False,
         transport=transport,
+        event_hooks={"request": [record]} if request_log is not None else None,
     )
 
 

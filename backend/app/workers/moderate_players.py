@@ -1,9 +1,11 @@
 import asyncio
 import logging
 
+import httpx2
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import RustAppError, RustAppHTTPError
 from app.clients.rustapp.retry_after import parse_retry_after
@@ -23,9 +25,13 @@ async def run() -> None:
     project = config.rustapp_project_id
     async with (
         open_database_sessions(DatabaseSettings()) as sessions,
-        create_rustapp_http_client(config) as http,
+        create_rustapp_http_client(config, request_log=sessions) as http,
+        httpx2.AsyncClient(
+            base_url=settings.ban_guard_url, timeout=3, trust_env=False
+        ) as guard_http,
     ):
         client = RustAppClient(http)
+        guard = BanGuard(guard_http, project)
         loop = asyncio.get_running_loop()
         next_request = 0.0
 
@@ -34,7 +40,7 @@ async def run() -> None:
             await asyncio.sleep(max(0, next_request - loop.time()))
             next_request = loop.time() + settings.request_interval
 
-        http.event_hooks["request"].append(pace)
+        http.event_hooks["request"].insert(0, pace)
         sync_due = 0.0
         while True:
             delay = 0
@@ -63,7 +69,7 @@ async def run() -> None:
                         await collect(db, client, job, settings)
                     else:
                         delay = 2
-                await deliver(sessions, client, project, settings)
+                await deliver(sessions, client, project, settings, guard)
             except RustAppHTTPError as exc:
                 if exc.status_code in (401, 403):
                     raise

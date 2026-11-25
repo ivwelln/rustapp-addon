@@ -61,8 +61,12 @@ services:
       - ALL
     security_opt:
       - "no-new-privileges:true"
+    depends_on:
+      db:
+        condition: service_healthy
     secrets:
       - app_rustapp_access_token
+      - app_db_password
   listener:
     profiles: ["tools"]
     image: rustapp-addon-backend:prod
@@ -82,6 +86,34 @@ services:
     secrets:
       - app_rustapp_access_token
       - app_db_password
+  ban-guard:
+    profiles: ["tools"]
+    image: rustapp-addon-backend:prod
+    build:
+      context: ./backend
+      target: prod
+    command: ["uvicorn", "app.ban_guard.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      db:
+        condition: service_healthy
+    secrets:
+      - app_db_password
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"
+      interval: 5s
+      timeout: 3s
+      retries: 6
   moderation:
     profiles: ["tools"]
     image: rustapp-addon-backend:prod
@@ -104,6 +136,8 @@ services:
       APP_MODERATION_PATTERNS: ${APP_MODERATION_PATTERNS:-{}}
       APP_MODERATION_SERVER_ID: ${APP_MODERATION_SERVER_ID:-163}
     depends_on:
+      ban-guard:
+        condition: service_healthy
       db:
         condition: service_healthy
     secrets:

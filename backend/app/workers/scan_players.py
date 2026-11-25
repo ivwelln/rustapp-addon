@@ -14,7 +14,8 @@ from app.clients.rustapp.exceptions import (
 )
 from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.retry_after import parse_retry_after
-from app.core.config import Settings, get_settings
+from app.core.config import DatabaseSettings, Settings, get_settings
+from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayersPage
 
 logger = logging.getLogger(__name__)
@@ -72,12 +73,16 @@ async def poll_players(client: RustAppClient, *, project_id: int) -> None:
 async def run_worker(*, continuous: bool = False) -> int:
     try:
         settings: Settings = get_settings()
+        database_settings = DatabaseSettings()
     except (SettingsError, ValidationError):
         logger.error("Не удалось загрузить настройки RustApp.")
         return 1
 
     try:
-        async with create_rustapp_http_client(settings) as http:
+        async with (
+            open_database_sessions(database_settings) as sessions,
+            create_rustapp_http_client(settings, request_log=sessions) as http,
+        ):
             client = RustAppClient(http)
             if continuous:
                 await poll_players(client, project_id=settings.rustapp_project_id)

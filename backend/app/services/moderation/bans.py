@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import (
     RustAppHTTPError,
@@ -215,10 +216,11 @@ async def deliver(
     client: RustAppClient,
     project: int,
     settings: ModerationSettings,
+    guard: BanGuard,
 ) -> None:
     if not settings.enforce:
         return
-    # Claim durably before sending. An ambiguous PUT is reconciled by marker, never repeated.
+    # The guard commits the claim before sending, so ambiguous PUTs keep their slot.
     async with sessions.begin() as db:
         other = aliased(Decision)
         unresolved = (
@@ -243,6 +245,8 @@ async def deliver(
             .with_for_update(skip_locked=True)
         )
         if row is None:
+            return
+        if not await guard.available():
             return
         sid = row.steam_id
         key = row.id
@@ -322,7 +326,6 @@ async def deliver(
                 )
                 return
         row.ban_ip = target_ip
-        row.state = "sending"
         body = {
             "steam_id": sid,
             "ban_ip_active": True,
@@ -333,10 +336,15 @@ async def deliver(
             "comment": f"{marker} | {reason}",
             "destroy_buildings": False,
         }
+    if not await guard.claim(key, pattern, target_ip):
+        return
     try:
         async with sessions.begin() as db:
-            if await whitelisted(db, project, sid, lock=True):
-                claimed = await db.get(Decision, key, with_for_update=True)
+            trusted = await whitelisted(db, project, sid, lock=True)
+            claimed = await db.get(Decision, key, with_for_update=True)
+            if claimed.state != "sending":
+                return
+            if trusted:
                 claimed.state = "cancelled"
                 return
             logger.info(
