@@ -56,7 +56,13 @@ class RustAppClient:
         *,
         params: Mapping[str, str | int | float | bool | None] | None = None,
     ) -> httpx2.Response:
-        request = self._http.build_request("GET", path, params=params)
+        return await self._send(self._http.build_request("GET", path, params=params))
+
+    async def put_player_ban(self, steam_id: str, body: dict) -> httpx2.Response:
+        request = self._http.build_request("PUT", f"/players/{steam_id}/ban", json=body)
+        return await self._send(request)
+
+    async def _send(self, request: httpx2.Request) -> httpx2.Response:
 
         if _origin(request.url) != self._expected_origin or request.url.userinfo:
             raise ValueError("Запрос выходит за пределы адреса клента RustApp")

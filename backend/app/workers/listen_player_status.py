@@ -31,6 +31,7 @@ from app.clients.rustapp.handshake import fetch_centrifugo_token
 from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, get_settings
+from app.crud.moderation import enqueue
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer, RustAppPlayersPage
 from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
@@ -140,6 +141,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 if self._snapshot_task is task:
                     players = self._apply_snapshot(page)
                     await self._persist_snapshot(players, observed_at=observed_at)
+                    await self._enqueue_players([p.steam_id for p in players], seed=True)
                     self._snapshot_loaded = True
                 return
         except RustAppError as exc:
@@ -192,6 +194,17 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 logger.info("Снимок обработан в PostgreSQL | Игроков: %d", count)
                 return
 
+    async def _enqueue_players(self, players: list[str], *, seed: bool) -> None:
+        while True:
+            try:
+                async with self._db_sessions.begin() as db:
+                    await enqueue(db, self._project_id, players, seed=seed)
+            except (SQLAlchemyError, OSError) as exc:
+                logger.warning("Не удалось поставить игроков в очередь (%s)", type(exc).__name__)
+                await asyncio.sleep(SNAPSHOT_DB_RETRY_SECONDS)
+            else:
+                return
+
     async def on_publication(self, ctx: PublicationContext) -> None:
         try:
             update = RustAppPlayerStatusUpdate.model_validate(ctx.pub.data)
@@ -200,7 +213,10 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             return
 
         logger.debug("Статусы игроков: %s", update.players)
-        for steam_id in self._sessions.apply(update.players):
+        joined = self._sessions.apply(update.players)
+        if joined:
+            await self._enqueue_players(joined, seed=False)
+        for steam_id in joined:
             logger.info("Подтверждён заход  |  SteamID:  %s", steam_id)
 
 
