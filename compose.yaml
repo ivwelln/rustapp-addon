@@ -82,6 +82,33 @@ services:
     secrets:
       - app_rustapp_access_token
       - app_db_password
+  moderation:
+    profiles: ["tools"]
+    image: rustapp-addon-backend:prod
+    build:
+      context: ./backend
+      target: prod
+    command: ["python", "-m", "app.workers.moderate_players"]
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      APP_MODERATION_INITIAL_BAN_PAGES:
+      APP_MODERATION_REQUEST_INTERVAL:
+      APP_MODERATION_POLL_SECONDS:
+      APP_MODERATION_ENFORCE: ${APP_MODERATION_ENFORCE:-false}
+      APP_MODERATION_PATTERNS: ${APP_MODERATION_PATTERNS:-{}}
+      APP_MODERATION_SERVER_ID: ${APP_MODERATION_SERVER_ID:-163}
+    depends_on:
+      db:
+        condition: service_healthy
+    secrets:
+      - app_rustapp_access_token
+      - app_db_password
   migrate:
     profiles: ["tools"]
     image: rustapp-addon-backend:prod
