@@ -63,12 +63,31 @@ services:
       - "no-new-privileges:true"
     secrets:
       - app_rustapp_access_token
+  migrate:
+    profiles: ["tools"]
+    image: rustapp-addon-backend:prod
+    build:
+      context: ./backend
+      target: prod
+    command: ["alembic", "upgrade", "head"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      db:
+        condition: service_healthy
+    secrets:
+      - app_db_password
 
 secrets:
   postgres_password:
     file: ./secrets/postgres_password
   app_rustapp_access_token:
     file: ./secrets/app_rustapp_access_token
+  app_db_password:
+    file: ./secrets/app_db_password
 
 volumes:
   pgdata:
