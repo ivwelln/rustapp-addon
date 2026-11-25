@@ -4,6 +4,8 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from app.services.moderation.facts import Patterns
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -43,3 +45,16 @@ class DatabaseSettings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+class ModerationSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="APP_MODERATION_", env_nested_delimiter="__", frozen=True, extra="ignore"
+    )
+    server_id: int = Field(default=163, gt=0)
+    enforce: bool = False
+    poll_seconds: int = Field(default=45, ge=1)
+    initial_ban_pages: int = Field(default=1, ge=1)
+    request_interval: float = Field(default=1.0, gt=0)
+    ban_minutes: int | None = Field(default=None, gt=0)
+    patterns: Patterns = Patterns()
