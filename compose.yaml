@@ -97,7 +97,6 @@ services:
     security_opt:
       - "no-new-privileges:true"
     environment:
-      APP_MODERATION_BAN_MINUTES:
       APP_MODERATION_INITIAL_BAN_PAGES:
       APP_MODERATION_REQUEST_INTERVAL:
       APP_MODERATION_POLL_SECONDS:

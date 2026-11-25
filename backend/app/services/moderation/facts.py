@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -92,6 +93,16 @@ class Session(BaseModel):
     joined_at: int | None = None
     disconnected_at: int | None = None
     is_license: bool | None = None
+    ip: str | None = Field(default=None, repr=False)
+
+    @property
+    def ban_ip(self) -> str | None:
+        if not self.ip:
+            return None
+        try:
+            return str(ip_address(self.ip))
+        except ValueError:
+            return None
 
     @model_validator(mode="after")
     def check_times(self):
@@ -125,10 +136,12 @@ class Facts:
 
 
 def recent_kills(facts: Facts, minutes: int) -> list[Kill]:
-    return [k for k in facts.kills if facts.at - minutes * MINUTE <= k.created_at <= facts.at]
+    return [
+        kill for kill in facts.kills if facts.at - minutes * MINUTE <= kill.created_at <= facts.at
+    ]
 
 
 def distinct(kills: list[Kill], minimum: int) -> dict | None:
-    if len({k.victim for k in kills}) >= minimum:
-        return {"kills": [k.model_dump() for k in kills]}
+    if len({kill.victim for kill in kills}) >= minimum:
+        return {"kills": [kill.model_dump() for kill in kills]}
     return None

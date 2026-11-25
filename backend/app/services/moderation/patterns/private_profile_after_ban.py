@@ -6,12 +6,12 @@ def evaluate(facts: Facts, rule: RecentBan) -> dict | None:
         return None
     connected = facts.session.connected_at
     ids = [
-        b.id
-        for b in facts.bans
-        if b.steam_id != facts.player
-        and b.pirated
-        and b.server_id == facts.session.server_id
-        and 0 < connected - b.at <= rule.minutes * MINUTE
+        ban.id
+        for ban in facts.bans
+        if ban.steam_id != facts.player
+        and ban.pirated
+        and ban.server_id == facts.session.server_id
+        and 0 < connected - ban.at <= rule.minutes * MINUTE
     ]
     if ids:
         return {"connected_at": connected, "prior_bans": ids, "private_without_date": True}

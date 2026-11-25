@@ -141,7 +141,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 if self._snapshot_task is task:
                     players = self._apply_snapshot(page)
                     await self._persist_snapshot(players, observed_at=observed_at)
-                    await self._enqueue_players([p.steam_id for p in players], seed=True)
+                    await self._enqueue_players([player.steam_id for player in players], seed=True)
                     self._snapshot_loaded = True
                 return
         except RustAppError as exc:

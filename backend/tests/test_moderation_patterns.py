@@ -22,18 +22,18 @@ def example() -> Facts:
     return Facts(SID, session, START, True, 12345, True, START + MINUTE, (), ())
 
 
-def hits(n=5):
+def hits(count=5):
     return tuple(
         Kill(
-            id=i,
-            created_at=START + 1000 + i,
-            victim=str(i),
+            id=event_number,
+            created_at=START + 1000 + event_number,
+            victim=str(event_number),
             weapon="rifle.ak",
             head=True,
             distance=50,
             head_hits_only=2,
         )
-        for i in range(n)
+        for event_number in range(count)
     )
 
 
@@ -60,7 +60,7 @@ def test_registration_requires_same_prior_ban_for_both_rules():
 @pytest.mark.parametrize("code", ["P03", "P04", "P05", "P06", "P07", "P09"])
 def test_each_selected_rule_can_be_the_only_reason(code):
     rules = Patterns.model_validate(
-        {k: {"action": "off"} for k in Patterns.model_fields if k != code}
+        {pattern: {"action": "off"} for pattern in Patterns.model_fields if pattern != code}
     )
     ctx = replace(
         example(), kills=hits(), bans=(Ban(1, "previous", START - 5 * MINUTE, None, 163, True),)
@@ -71,7 +71,9 @@ def test_each_selected_rule_can_be_the_only_reason(code):
 
 
 def test_repeated_victim_ratio_and_end_of_first_ten_minutes():
-    ctx = replace(example(), kills=tuple(k.model_copy(update={"victim": "same"}) for k in hits()))
+    ctx = replace(
+        example(), kills=tuple(kill.model_copy(update={"victim": "same"}) for kill in hits())
+    )
     assert set(evaluate(ctx, Patterns(), entry=False)) == {"P07"}
     ctx = replace(ctx, kills=hits(), at=ctx.session.joined_at + 10 * MINUTE)
     assert "P03" not in evaluate(ctx, Patterns(), entry=False)

@@ -56,5 +56,4 @@ class ModerationSettings(BaseSettings):
     poll_seconds: int = Field(default=45, ge=1)
     initial_ban_pages: int = Field(default=1, ge=1)
     request_interval: float = Field(default=1.0, gt=0)
-    ban_minutes: int | None = Field(default=None, gt=0)
     patterns: Patterns = Patterns()

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Iterable
 from time import time_ns
 
@@ -6,8 +7,10 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.moderation import CollectionJob, CombatKill, Decision, Observation, ReferenceBan
-from app.services.moderation.evaluate import outcome
+from app.services.moderation.evaluate import describe, outcome
 from app.services.moderation.facts import MINUTE, Ban, Kill, Patterns, Session
+
+logger = logging.getLogger(__name__)
 
 
 def now_ms() -> int:
@@ -91,7 +94,15 @@ async def reference_bans(
         .order_by(ReferenceBan.ban_id)
     )
     return tuple(
-        Ban(r.ban_id, r.steam_id, r.at, r.signed_at, r.server_id, r.pirated) for r in records
+        Ban(
+            record.ban_id,
+            record.steam_id,
+            record.at,
+            record.signed_at,
+            record.server_id,
+            record.pirated,
+        )
+        for record in records
     )
 
 
@@ -123,9 +134,21 @@ async def save_decision(
     # Keep the first evidence and freeze the dispatch reason once an action has been claimed.
     if decision.state in {"sending", "confirmed", "superseded", "failed", "cancelled"}:
         return
+    previous_primary = decision.primary_pattern
     previous = decision.matches
     decision.matches = {**matches, **previous}
     decision.primary_pattern, decision.action = outcome(decision.matches)
+    if not enforce and decision.action == "ban" and decision.primary_pattern != previous_primary:
+        await db.flush()
+        logger.info(
+            "Наблюдение: правило предлагает блокировку | решение=%s SteamID=%s "
+            "проект=%s паттерн=%s | %s",
+            decision.id,
+            session.steam_id,
+            session.project_id,
+            decision.primary_pattern,
+            describe(decision.primary_pattern, decision.matches[decision.primary_pattern]),
+        )
     if (
         decision.action == "ban"
         and enforce

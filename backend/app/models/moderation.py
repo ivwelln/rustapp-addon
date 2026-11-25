@@ -64,6 +64,7 @@ class Decision(Base):
     state: Mapped[str] = mapped_column(Text)
     primary_pattern: Mapped[str] = mapped_column(Text)
     matches: Mapped[dict] = mapped_column(JSONB)
+    ban_ip: Mapped[str | None] = mapped_column(Text)
     external_id: Mapped[int | None] = mapped_column(BigInteger)
     __table_args__ = (
         Index(

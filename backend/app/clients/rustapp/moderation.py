@@ -48,16 +48,16 @@ def parse_kill(row: dict, sid: str) -> Kill | None:
         return None
     hits = row.get("hit_history")
     damaging = []
-    for h in hits if isinstance(hits, list) else ():
-        if not isinstance(h, dict):
+    for hit in hits if isinstance(hits, list) else ():
+        if not isinstance(hit, dict):
             damaging = []
             break
-        if h.get("attacker_steam_id") == sid and h.get("target_steam_id") == victim:
-            if not all(type(h.get(key)) in (int, float) for key in ("hp_old", "hp_new")):
+        if hit.get("attacker_steam_id") == sid and hit.get("target_steam_id") == victim:
+            if not all(type(hit.get(key)) in (int, float) for key in ("hp_old", "hp_new")):
                 damaging = []
                 break
-            if h["hp_old"] > h["hp_new"]:
-                damaging.append(h)
+            if hit["hp_old"] > hit["hp_new"]:
+                damaging.append(hit)
     return Kill(
         id=row["id"],
         created_at=row["created_at"],
@@ -65,7 +65,7 @@ def parse_kill(row: dict, sid: str) -> Kill | None:
         weapon=row.get("weapon") or "",
         head=row.get("kill_bone") == "head",
         distance=row.get("distance"),
-        head_hits_only=len(damaging) if all(h.get("bone") == "head" for h in damaging) else 0,
+        head_hits_only=len(damaging) if all(hit.get("bone") == "head" for hit in damaging) else 0,
     )
 
 

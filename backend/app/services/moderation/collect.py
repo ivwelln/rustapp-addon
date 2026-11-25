@@ -27,10 +27,10 @@ async def fetch_sessions(
     client: RustAppClient, project: int, sid: str
 ) -> tuple[list[Session], dict]:
     data = await read(client, f"/players/{sid}/session-history", page=0, limit=20)
-    records = [Session.model_validate(s) for s in results(data)]
-    if any(s.steam_id != sid or s.project_id != project for s in records):
+    records = [Session.model_validate(session) for session in results(data)]
+    if any(session.steam_id != sid or session.project_id != project for session in records):
         raise RustAppResponseError("Получены чужие сессии")
-    return sorted(records, key=lambda s: s.connected_at), data
+    return sorted(records, key=lambda session: session.connected_at), data
 
 
 async def collect(
@@ -41,7 +41,7 @@ async def collect(
     records, data = await fetch_sessions(client, project, sid)
     last_history = await latest(db, project, sid, "session-history")
     if records and last_history is not None:
-        known_connections = {s["connected_at"] for s in results(last_history.payload)}
+        known_connections = {session["connected_at"] for session in results(last_history.payload)}
         fresh = fresh or records[-1].connected_at not in known_connections
     await archive(db, project, sid, "session-history", data)
     last_profile = await latest(db, project, sid, "details")
@@ -87,7 +87,11 @@ async def collect(
             await save_kill(db, project, row["server_id"], sid, kill)
 
     previous = job.collected_at
-    eligible = [s for s in records if s.server_id == settings.server_id and s.connected_at <= now]
+    eligible = [
+        session
+        for session in records
+        if session.server_id == settings.server_id and session.connected_at <= now
+    ]
     job.collected_at = now
     current = eligible[-1] if eligible else None
     active = current is not None and current.disconnected_at is None
@@ -137,8 +141,8 @@ async def collect(
         )
         .order_by(CombatKill.at, CombatKill.event_id)
     )
-    kills = tuple(Kill.model_validate(k.facts) for k in stored)
-    first = next((s for s in eligible if s.joined_at is not None), None)
+    kills = tuple(Kill.model_validate(record.facts) for record in stored)
+    first = next((session for session in eligible if session.joined_at is not None), None)
     # A full page can hide earlier sessions unless it reaches the creation of the project profile.
     complete_start = len(records) < 20 or records[0].connected_at <= profile.created_at
     first_join = first == current and complete_start
@@ -157,9 +161,11 @@ async def collect(
     )
     matches = evaluate(facts, rules, entry=True) if first_join else {}
     # Revisit the recent window after reconnects or late publication of a hit log.
-    for k in kills:
-        if k.created_at < start:
+    for kill in kills:
+        if kill.created_at < start:
             continue
-        for code, result in evaluate(replace(facts, at=k.created_at), rules, entry=False).items():
+        for code, result in evaluate(
+            replace(facts, at=kill.created_at), rules, entry=False
+        ).items():
             matches.setdefault(code, result)
     await save_decision(db, current, matches, enforce=settings.enforce and active)

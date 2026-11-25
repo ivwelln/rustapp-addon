@@ -78,14 +78,17 @@ def describe(code: str, match: dict) -> str:
             f"{data['heads']} из {data['total']} убийств в голову с {config['meters']:g} м "
             f"за {config['minutes']} мин"
         )
-    count = len({k["victim"] for k in data["kills"]})
+    count = len({kill["victim"] for kill in data["kills"]})
     if code == "P03":
         return (
             f"Закрытый профиль без даты Steam. Разных жертв за первые "
             f"{config['minutes']} мин: {count}"
         )
     if code == "P05":
-        return f"Разных жертв в голову с {config['meters']:g} м за {config['minutes']} мин: {count}"
+        return (
+            f"За {config['minutes']} мин убито в голову {count} разных жертв "
+            f"с дистанции от {config['meters']:g} м"
+        )
     if code == "P06":
         return (
             f"За {config['minutes']} мин у {count} жертв по {config['hits']} "
