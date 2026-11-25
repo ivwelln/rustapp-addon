@@ -7,11 +7,12 @@ from sqlalchemy import select
 
 from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
-from app.clients.rustapp.exceptions import RustAppError, RustAppHTTPError
+from app.clients.rustapp.exceptions import PlayerAfk, RustAppError, RustAppHTTPError
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, ModerationSettings, get_settings
 from app.core.logging import configure_console_logging
 from app.crud.moderation import now_ms
+from app.crud.presence import is_afk, player_is_afk
 from app.db.session import open_database_sessions
 from app.models import CollectionJob
 from app.services.moderation.bans import deliver, reconcile, sync_bans
@@ -49,11 +50,24 @@ async def run() -> None:
             await asyncio.sleep(max(0, next_request - loop.time()))
             next_request = loop.time() + settings.request_interval
 
-        http.event_hooks["request"].insert(0, pace)
+        async def skip_afk_request(request: httpx2.Request) -> None:
+            parts = request.url.path.strip("/").split("/")
+            steam_id = parts[1] if len(parts) == 3 and parts[0] == "players" else None
+            if request.url.path == "/ban/browse":
+                steam_id = request.url.params.get("steam_id")
+            if steam_id is None:
+                return
+            async with sessions() as db:
+                if await is_afk(db, project, steam_id):
+                    logger.debug("RustApp: запрос отложен на время AFK | SteamID=%s", steam_id)
+                    raise PlayerAfk
+
+        http.event_hooks["request"][:0] = [pace, skip_afk_request]
         sync_due = 0.0
         while True:
             delay = 0
             job_key = None
+            finished = False
             try:
                 if loop.time() >= sync_due:
                     sync_due = loop.time() + 60
@@ -68,7 +82,9 @@ async def run() -> None:
                     job = await db.scalar(
                         select(CollectionJob)
                         .where(
-                            CollectionJob.project_id == project, CollectionJob.due_at <= now_ms()
+                            CollectionJob.project_id == project,
+                            CollectionJob.due_at <= now_ms(),
+                            ~player_is_afk(CollectionJob.project_id, CollectionJob.steam_id),
                         )
                         .order_by(CollectionJob.due_at)
                         .limit(1)
@@ -81,11 +97,16 @@ async def run() -> None:
                             job.steam_id,
                             (now_ms() - job.due_at) / 1000,
                         )
-                        await collect(db, client, job, settings)
-                        next_check = job.due_at
+                        try:
+                            await collect(db, client, job, settings)
+                        except PlayerAfk:
+                            logger.debug("Модерация: сбор приостановлен | SteamID=%s", job.steam_id)
+                        else:
+                            next_check = job.due_at
+                            finished = True
                     else:
                         delay = 2
-                if job_key is not None:
+                if finished and job_key is not None:
                     logger.info(
                         "Модерация: проверка завершена | SteamID=%s следующая проверка=%s",
                         job_key[1],
@@ -94,6 +115,8 @@ async def run() -> None:
                         else "снята с расписания",
                     )
                 await deliver(sessions, client, project, settings, guard)
+            except PlayerAfk:
+                logger.debug("Модерация: отправка отложена на время AFK")
             except RustAppHTTPError as exc:
                 if exc.status_code in (401, 403):
                     raise

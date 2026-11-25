@@ -44,3 +44,12 @@ class PlayerReport(Base):
     steam_id: Mapped[str] = mapped_column(Text)
     created_at: Mapped[int] = mapped_column(BigInteger)
     payload: Mapped[dict] = mapped_column(JSONB)
+
+
+class PlayerPresence(Base):
+    __tablename__ = "rustapp_player_presence"
+
+    project_id: Mapped[int] = mapped_column(primary_key=True)
+    steam_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    is_afk: Mapped[bool]
+    observed_at: Mapped[int] = mapped_column(BigInteger)

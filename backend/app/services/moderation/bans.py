@@ -10,6 +10,7 @@ from sqlalchemy.orm import aliased
 from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import (
+    PlayerAfk,
     RustAppHTTPError,
     RustAppResponseError,
     RustAppTransportError,
@@ -19,6 +20,7 @@ from app.core.config import ModerationSettings
 from app.crud.moderation import archive, latest, now_ms
 from app.crud.player_data import stored_sessions
 from app.crud.players import whitelist_for_playtime, whitelisted
+from app.crud.presence import is_afk, player_is_afk
 from app.models import Decision, ReferenceBan
 from app.services.moderation.collect import (
     cache_profile,
@@ -99,16 +101,24 @@ async def sync_bans(
                 if cached_profile is not None:
                     signed_at = Profile.model_validate(cached_profile.payload["player"]).signed_at
                 try:
-                    if signed_at is None and not await whitelisted(db, project, sid):
+                    if (
+                        signed_at is None
+                        and not await is_afk(db, project, sid)
+                        and not await whitelisted(db, project, sid)
+                    ):
                         profile, details = await fetch_profile(client, project, sid)
                         signed_at = profile.signed_at
                         await cache_profile(db, project, sid, details)
                     cached_history = await latest(db, project, sid, "session-history")
                     if (
-                        cached_history is None or cached_history.observed_at < ban["created_at"]
-                    ) and not await whitelisted(db, project, sid):
+                        (cached_history is None or cached_history.observed_at < ban["created_at"])
+                        and not await is_afk(db, project, sid)
+                        and not await whitelisted(db, project, sid)
+                    ):
                         sessions, history = await fetch_sessions(client, project, sid)
                         await cache_sessions(db, project, sid, history)
+                except PlayerAfk:
+                    pass
                 except RustAppHTTPError as exc:
                     if exc.status_code not in (404, 422):
                         raise
@@ -239,6 +249,7 @@ async def deliver(
                 Decision.server_id == settings.server_id,
                 Decision.state == "pending",
                 ~unresolved,
+                ~player_is_afk(Decision.project_id, Decision.steam_id),
             )
             .order_by(Decision.id)
             .limit(1)
@@ -347,6 +358,9 @@ async def deliver(
             if trusted:
                 claimed.state = "cancelled"
                 return
+            if await is_afk(db, project, sid):
+                claimed.state = "pending"
+                return
             logger.info(
                 "Отправка бессрочного бана на все серверы проекта по SteamID и IP | "
                 "решение=%s SteamID=%s проект=%s паттерн=%s | %s",
@@ -357,6 +371,12 @@ async def deliver(
                 reason,
             )
             await client.put_player_ban(sid, {"bans": [body], "override_broadcast": False})
+    except PlayerAfk:
+        async with sessions.begin() as db:
+            claimed = await db.get(Decision, key, with_for_update=True)
+            if claimed.state == "sending":
+                claimed.state = "pending"
+        raise
     except RustAppTransportError:
         logger.warning(
             "Результат отправки неизвестен, ожидаем сверки | решение=%s SteamID=%s паттерн=%s | %s",
@@ -386,7 +406,7 @@ async def deliver(
 async def reconciliation_bans(
     db: AsyncSession, client: RustAppClient, project: int, steam_id: str
 ) -> AsyncIterator[dict]:
-    if await whitelisted(db, project, steam_id, lock=True):
+    if await is_afk(db, project, steam_id) or await whitelisted(db, project, steam_id, lock=True):
         cached_bans = await db.scalars(
             select(ReferenceBan.payload).where(
                 ReferenceBan.project_id == project,
@@ -396,8 +416,11 @@ async def reconciliation_bans(
         for ban in cached_bans:
             yield ban
     else:
-        async for ban in player_bans(db, client, project, steam_id):
-            yield ban
+        try:
+            async for ban in player_bans(db, client, project, steam_id):
+                yield ban
+        except PlayerAfk:
+            return
 
 
 async def reconcile(db: AsyncSession, client: RustAppClient, project: int, server: int) -> None:

@@ -21,3 +21,7 @@ class RustAppHTTPError(RustAppError):
 
 class RustAppResponseError(RustAppError):
     """RustApp вернул ответ неожиданного формата."""
+
+
+class PlayerAfk(RustAppError):
+    """Персональный запрос отменён, пока игрок находится в AFK."""

@@ -1,6 +1,8 @@
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from time import time_ns
 
 from centrifuge import (
     CentrifugeError,
@@ -33,6 +35,7 @@ from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, get_settings
 from app.core.logging import configure_console_logging
 from app.crud.moderation import enqueue
+from app.crud.presence import save_presence
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer, RustAppPlayersPage
 from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
@@ -119,6 +122,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                     continue
 
                 observed_at = datetime.now(UTC)
+                presence_at = time_ns()
                 try:
                     page = await fetch_players_page(
                         self._court_client, page=0, limit=MAX_PLAYERS_PAGE_SIZE
@@ -142,7 +146,12 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 if self._snapshot_task is task:
                     players = self._apply_snapshot(page)
                     await self._persist_snapshot(players, observed_at=observed_at)
-                    await self._enqueue_players([player.steam_id for player in players], seed=True)
+                    statuses = {
+                        player.steam_id: player.status
+                        for player in players
+                        if player.status in ("online", "afk")
+                    }
+                    await self._update_presence(statuses, presence_at, seed=True)
                     self._snapshot_loaded = True
                 return
         except RustAppError as exc:
@@ -195,15 +204,43 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 logger.info("Снимок обработан в PostgreSQL | Игроков: %d", count)
                 return
 
-    async def _enqueue_players(self, players: list[str], *, seed: bool) -> None:
+    async def _update_presence(
+        self,
+        statuses: Mapping[str, PlayerStatus],
+        observed_at: int,
+        *,
+        joined: tuple[str, ...] = (),
+        discovered: tuple[str, ...] = (),
+        seed: bool = False,
+    ) -> None:
         while True:
             try:
                 async with self._db_sessions.begin() as db:
-                    await enqueue(db, self._project_id, players, seed=seed)
+                    online, resumed = await save_presence(
+                        db, self._project_id, statuses, observed_at
+                    )
             except (SQLAlchemyError, OSError) as exc:
-                logger.warning("Не удалось поставить игроков в очередь (%s)", type(exc).__name__)
+                logger.warning("Не удалось сохранить статусы игроков (%s)", type(exc).__name__)
                 await asyncio.sleep(SNAPSHOT_DB_RETRY_SECONDS)
             else:
+                break
+
+        checks = online if seed else online.intersection(joined)
+        checks |= online.intersection(discovered) - resumed
+        restart = resumed - set(joined)
+        while True:
+            try:
+                async with self._db_sessions.begin() as db:
+                    await enqueue(db, self._project_id, checks - restart, seed=seed)
+                    await enqueue(db, self._project_id, restart, seed=False, resume=True)
+            except (SQLAlchemyError, OSError) as exc:
+                logger.warning("Не удалось обновить очередь игроков (%s)", type(exc).__name__)
+                await asyncio.sleep(SNAPSHOT_DB_RETRY_SECONDS)
+            else:
+                if restart:
+                    logger.info(
+                        "RustApp: проверки возобновлены после AFK | игроков=%d", len(restart)
+                    )
                 return
 
     async def on_publication(self, ctx: PublicationContext) -> None:
@@ -214,9 +251,10 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             return
 
         logger.debug("RustApp WebSocket: получены статусы | игроков=%d", len(update.players))
-        joined = self._sessions.apply(update.players)
-        if joined:
-            await self._enqueue_players(joined, seed=False)
+        joined, discovered = self._sessions.apply(update.players)
+        await self._update_presence(
+            update.players, time_ns(), joined=tuple(joined), discovered=tuple(discovered)
+        )
         for steam_id in joined:
             logger.info("Подтверждён заход  |  SteamID:  %s", steam_id)
 

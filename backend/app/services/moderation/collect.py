@@ -12,6 +12,7 @@ from app.core.config import ModerationSettings
 from app.crud.moderation import archive, latest, now_ms, reference_bans, save_decision, save_kill
 from app.crud.player_data import save_ip, save_reports, save_sessions, stored_sessions
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
+from app.crud.presence import is_afk
 from app.models import CollectionJob, CombatKill, PlayerData
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
@@ -133,6 +134,8 @@ async def collect(
     db: AsyncSession, client: RustAppClient, job: CollectionJob, settings: ModerationSettings
 ) -> None:
     project, sid = job.project_id, job.steam_id
+    if await is_afk(db, project, sid):
+        return
     if await whitelisted(db, project, sid, lock=True):
         job.due_at = None
         logger.debug("Модерация: пропуск по белому списку | SteamID=%s", sid)
