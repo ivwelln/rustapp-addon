@@ -9,13 +9,20 @@ from app.services.moderation.facts import Session
 
 
 async def save_response(
-    db: AsyncSession, project: int, steam_id: str, source: str, observed_at: int, payload: dict
+    db: AsyncSession,
+    project: int,
+    steam_id: str,
+    source: str,
+    observed_at: int,
+    payload: dict,
+    *,
+    params: dict | None = None,
 ) -> None:
     statement = insert(PlayerData).values(
         project_id=project,
         steam_id=steam_id,
         updated_at=observed_at,
-        responses={source: {"observed_at": observed_at, "payload": payload}},
+        responses={source: {"observed_at": observed_at, "payload": payload, "params": params}},
     )
     await db.execute(
         statement.on_conflict_do_update(

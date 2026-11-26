@@ -91,6 +91,7 @@ def decision_details(decision: Decision) -> dict:
         or decision.matches.get("P03", {}).get("evidence", {}).get("joined_at"),
         "reference_ban_id": decision.reference_ban_id,
         "verdict_note": decision.verdict_note,
+        "eligibility": decision.eligibility,
         "verdict_at": decision.verdict_at,
         "rules": rules,
     }

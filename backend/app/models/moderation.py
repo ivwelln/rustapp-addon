@@ -24,6 +24,7 @@ class Observation(Base):
     source: Mapped[str] = mapped_column(Text)
     observed_at: Mapped[int] = mapped_column(BigInteger)
     payload: Mapped[dict] = mapped_column(JSONB)
+    request_params: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     __table_args__ = (Index("ix_observation_lookup", "project_id", "steam_id", "source", "id"),)
 
 
@@ -85,6 +86,7 @@ class Decision(Base):
     joined_at: Mapped[int | None] = mapped_column(BigInteger)
     reference_ban_id: Mapped[int | None] = mapped_column(BigInteger)
     verdict: Mapped[str | None] = mapped_column(Text)
+    eligibility: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     verdict_note: Mapped[str | None] = mapped_column(Text)
     verdict_at: Mapped[int | None] = mapped_column(BigInteger)
     __table_args__ = (

@@ -28,6 +28,11 @@ from app.services.moderation.collect import (
     cache_profile,
     fetch_profile,
 )
+from app.services.moderation.eligibility import (
+    cached_project_ms,
+    hours_proof_is_current,
+    verify_ban_hours,
+)
 from app.services.moderation.evaluate import PRIORITY, describe
 from app.services.moderation.facts import MINUTE
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
@@ -59,7 +64,9 @@ async def usable_ban(db: AsyncSession, project: int, ban: dict) -> bool:
     else:
         # An edited panel comment must not turn a registration-derived ban into a manual seed.
         decision = await db.scalar(query.where(Decision.external_id == ban["id"]))
-    return decision is None or decision.primary_pattern not in {"P01", "P02"}
+    return decision is None or (
+        decision.verdict != "false_positive" and decision.primary_pattern not in {"P01", "P02"}
+    )
 
 
 async def sync_bans(
@@ -290,7 +297,9 @@ async def deliver(
             return
         sid = row.steam_id
         key = row.id
-        if await whitelisted(db, project, sid, lock=True):
+        if row.verdict in ("false_positive", "inconclusive") or await whitelisted(
+            db, project, sid, lock=True
+        ):
             row.state = "cancelled"
             return
         current = await db.get(PlayerPresence, (project, sid))
@@ -299,8 +308,9 @@ async def deliver(
             return
         now = now_ms()
         if (
-            played_ms(await known_sessions(db, project, sid, current, now), settings.server_id, now)
-            > WHITELIST_PLAYTIME_MS
+            played_ms(await known_sessions(db, project, sid, current, now), server_id=None, now=now)
+            >= WHITELIST_PLAYTIME_MS
+            or await cached_project_ms(db, project, sid, now) >= WHITELIST_PLAYTIME_MS
         ):
             await whitelist_for_playtime(db, project, sid)
             row.state = "cancelled"
@@ -378,6 +388,21 @@ async def deliver(
                     reason,
                 )
                 return
+        # Ban history pagination can outlive a session. Refresh the client identity again
+        # if the earlier profile is no longer recent, before reserving a guard slot.
+        if time_ns() - profile_observed_at > 10_000_000_000:
+            profile, details = await fetch_profile(client, project, sid)
+            if (
+                await cache_profile(db, project, sid, details)
+                or profile.last_no_license is not True
+                or profile.server_id != row.server_id
+                or profile.status != "online"
+                or profile.ip != target_ip
+            ):
+                row.state = "cancelled"
+                return
+        if not await verify_ban_hours(db, client, row):
+            return
         row.ban_ip = target_ip
         body = {
             "steam_id": sid,
@@ -397,14 +422,22 @@ async def deliver(
             claimed = await db.get(Decision, key, with_for_update=True)
             if claimed.state != "sending":
                 return
-            if trusted:
+            if trusted or claimed.verdict in ("false_positive", "inconclusive"):
                 claimed.state = "cancelled"
                 return
             presence = await db.get(PlayerPresence, (project, sid))
             if presence is None or presence.session_key != claimed.connected_at:
                 claimed.state = "cancelled"
                 return
-            if presence.status != "online":
+            if (
+                presence.status != "online"
+                or presence.server_id != claimed.server_id
+                or presence.is_pirated is not True
+                or not await presence_is_current(db, project, now_ms())
+            ):
+                claimed.state = "pending"
+                return
+            if not hours_proof_is_current(claimed.eligibility, now_ms()):
                 claimed.state = "pending"
                 return
             logger.info(

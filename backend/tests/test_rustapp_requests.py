@@ -27,7 +27,7 @@ async def test_request_times_include_errors_and_websocket_attempts(monkeypatch):
             assert await count() == before + 2
             raise httpx2.ReadTimeout("test", request=request)
         assert await count() == before + 1
-        return httpx2.Response(429)
+        return httpx2.Response(429, headers={"Retry-After": "0"})
 
     async def websocket_reply(_client):
         assert await count() == before + 3

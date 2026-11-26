@@ -79,9 +79,11 @@ async def latest(db: AsyncSession, project: int, sid: str, source: str) -> Obser
     )
 
 
-async def archive(db: AsyncSession, project: int, sid: str, source: str, data: dict) -> None:
+async def archive(
+    db: AsyncSession, project: int, sid: str, source: str, data: dict, *, params: dict | None = None
+) -> None:
     observed_at = now_ms()
-    await save_response(db, project, sid, source, observed_at, data)
+    await save_response(db, project, sid, source, observed_at, data, params=params)
     last = await latest(db, project, sid, source)
     if last is None or last.payload != data:
         db.add(
@@ -91,6 +93,7 @@ async def archive(db: AsyncSession, project: int, sid: str, source: str, data: d
                 source=source,
                 observed_at=observed_at,
                 payload=data,
+                request_params=params,
             )
         )
 

@@ -120,8 +120,14 @@ function rosterRow(record) {
     element("span", deaths));
   combat.title = record.priority ? "Вне белого списка: больше 5 убийств и меньше 2 смертей"
     : "Убийства и смерти за 24 часа по собранным данным";
+  const hours = record.project_played_ms == null ? "—"
+    : (record.playtime_days < 365 ? "≥ " : "") + number.format(record.project_played_ms / 3600000);
+  const playtime = element("td", hours, "number");
+  const local = record.observed_project_ms == null ? "—" : number.format(record.observed_project_ms / 3600000);
+  playtime.title = `Все серверы проекта. RustApp вернул данные за ${record.playtime_days || 0} из 365 дней. По нашим наблюдениям на проекте — ${local} ч.`;
+  if (record.trained) playtime.title += " Исследовательский срез готов.";
   row.append(identity, element("td", record.steam_id, "steam"), whitelist,
-    valueCell(record.provider || null), country, combat);
+    valueCell(record.provider || null), country, playtime, combat);
   return row;
 }
 
@@ -161,6 +167,14 @@ function renderDecision(record) {
     ["Вход в игру", evidenceDate(record.joined_at)], ["Состояние", labels[record.state]?.[0]],
     ["Бан RustApp", record.ban_id], ["Проверенный исходный бан", record.reference_ban_id],
   ]));
+  if (record.eligibility) {
+    const check = record.eligibility;
+    body.append(factsList([
+      ["Проверка допуска к бану", evidenceDate(check.checked_at)],
+      ["Часы RustApp за 365 дней", check.project_ms == null ? "Недостаточно данных" : number.format(check.project_ms / 3600000)],
+      ["Пиратский клиент подтверждён", check.pirated ? "Да" : null],
+    ]));
+  }
   if (record.reason) body.append(element("p", record.reason));
   for (const rule of record.rules) {
     const section = element("section", "");
@@ -282,7 +296,7 @@ function syncActivityRows(items, animate) {
       if (divider) {
         row = element("tr", "", "group-divider");
         const title = element("td", "Белый список");
-        title.colSpan = 6;
+        title.colSpan = 7;
         row.append(title);
       } else {
         row = activeTab === "players" ? rosterRow(record) : decisionRow(record);
@@ -330,7 +344,7 @@ function renderActivity() {
   get("search").setAttribute("aria-label", get("search").placeholder);
   get("columns").closest("table").classList.toggle("roster", players);
   const headers = players
-    ? ["Имя", "SteamID", "Белый список", "Провайдер", "Страна", "K/D"]
+    ? ["Имя", "SteamID", "Белый список", "Провайдер", "Страна", "Часы за год", "K/D"]
     : ["SteamID", "Правило и основание", "Статус", "Срабатывание"];
   const query = get("search").value.trim().toLocaleLowerCase("ru");
   const records = snapshot?.[activeTab].filter((record) => (

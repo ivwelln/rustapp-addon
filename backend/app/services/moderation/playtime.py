@@ -12,13 +12,13 @@ YEAR_MS = 365 * 24 * 60 * MINUTE
 WHITELIST_PLAYTIME_MS = 3 * 60 * MINUTE
 
 
-def played_ms(sessions: Iterable[Session], server_id: int, now: int) -> int:
-    """Count non-overlapping play intervals in the trailing year."""
+def played_ms(sessions: Iterable[Session], server_id: int | None, now: int) -> int:
+    """Count non-overlapping intervals across the project or on one requested server."""
     ordered = sorted(sessions, key=lambda session: session.connected_at)
     covered_until = now - YEAR_MS
     total = 0
     for index, session in enumerate(ordered):
-        if session.server_id != server_id or session.joined_at is None:
+        if session.joined_at is None or (server_id is not None and session.server_id != server_id):
             continue
         following = ordered[index + 1].connected_at if index + 1 < len(ordered) else None
         # A stale open record followed by another connection has no reliable end time.

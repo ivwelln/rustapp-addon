@@ -7,16 +7,22 @@ from sqlalchemy import select
 
 from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
-from app.clients.rustapp.exceptions import PlayerNotOnline, RustAppError, RustAppHTTPError
+from app.clients.rustapp.exceptions import (
+    PlayerNotOnline,
+    RustAppError,
+    RustAppHTTPError,
+    RustAppRequestNotSent,
+)
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, ModerationSettings, get_settings
 from app.core.logging import configure_console_logging
 from app.crud.moderation import now_ms
 from app.crud.presence import player_is_online, presence_is_current
 from app.db.session import open_database_sessions
-from app.models import CollectionJob, PlayerPresence
+from app.models import CollectionJob, Decision, PlayerPresence
 from app.services.moderation.bans import deliver, reconcile, sync_bans
 from app.services.moderation.collect import collect
+from app.services.moderation.eligibility import hours_proof_is_current
 
 logger = logging.getLogger(__name__)
 BAN_SYNC_SECONDS = 5 * 60
@@ -64,10 +70,34 @@ async def run() -> None:
                 if (
                     presence is None
                     or presence.status != "online"
+                    or (
+                        request.method == "PUT"
+                        and (
+                            presence.is_pirated is not True
+                            or presence.server_id != settings.server_id
+                        )
+                    )
                     or not await presence_is_current(db, project, now_ms())
                 ):
                     logger.debug("RustApp: персональный запрос пропущен | SteamID=%s", steam_id)
                     raise PlayerNotOnline
+                if request.method == "PUT":
+                    # The rate limiter may have waited since deliver() checked this session.
+                    decision = await db.scalar(
+                        select(Decision).where(
+                            Decision.project_id == project,
+                            Decision.steam_id == steam_id,
+                            Decision.server_id == presence.server_id,
+                            Decision.connected_at == presence.session_key,
+                            Decision.state == "sending",
+                        )
+                    )
+                    if decision is None or not hours_proof_is_current(
+                        decision.eligibility, now_ms()
+                    ):
+                        raise RustAppRequestNotSent(
+                            "Перед отправкой требуется новая проверка часов и сессии"
+                        )
 
         http.event_hooks["request"][:0] = [pace, skip_inactive_request]
         sync_due = 0.0

@@ -17,6 +17,13 @@ from app.models.player_data import (
     PlayerSession,
     PresenceHeartbeat,
 )
+from app.models.research import (
+    PlayerPlaytime,
+    PlaytimeDay,
+    ResearchCase,
+    ResearchSource,
+    RustAppGate,
+)
 from app.models.rustapp_request import RustAppRequest
 
 __all__ = [
@@ -36,4 +43,9 @@ __all__ = [
     "Observation",
     "ReferenceBan",
     "RustAppRequest",
+    "PlayerPlaytime",
+    "PlaytimeDay",
+    "ResearchCase",
+    "ResearchSource",
+    "RustAppGate",
 ]

@@ -17,7 +17,15 @@ from app.clients.rustapp.exceptions import RustAppRequestNotSent, RustAppTimeout
 from app.core.config import ModerationSettings, Settings
 from app.crud.moderation import archive, enqueue, now_ms
 from app.crud.presence import confirm_presence_connection, save_presence
-from app.models import CollectionJob, CombatKill, Decision, Observation, PlayerSession, ReferenceBan
+from app.models import (
+    CollectionJob,
+    CombatKill,
+    Decision,
+    Observation,
+    Player,
+    PlayerSession,
+    ReferenceBan,
+)
 from app.services.moderation.bans import covers_requested_ban, deliver, reconcile, sync_bans
 from app.services.moderation.collect import collect
 
@@ -35,6 +43,12 @@ from app.services.moderation.collect import collect
         "new_session",
         "other_server",
         "became_licensed",
+        "unknown_license",
+        "three_hours",
+        "protected_on_join",
+        "long_playtime",
+        "incomplete_year",
+        "stats_error",
         "local_counter_failure",
     ],
 )
@@ -70,6 +84,7 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
         for event_number in range(1, 4)
     ]
     submitted = []
+    before_delivery = False
     bans = [
         dict(
             id=788,
@@ -107,7 +122,24 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
         elif path.endswith("/checks"):
             data = {"total": 5, "results": [{"private": "omit"}]}
         elif path.endswith("/stats"):
-            data = {"kills": {}}
+            start_at = int(req.url.params["time_from"])
+            end_at = int(req.url.params["time_to"])
+            day_ms = 86_400_000
+            buckets = {
+                str(day): {"date": day, "hours_played": 0}
+                for day in range(start_at // day_ms * day_ms, end_at + 1, day_ms)
+            }
+            hours = (
+                {"three_hours": 3, "long_playtime": 21.67}.get(outcome, 0) if before_delivery else 0
+            )
+            if outcome == "protected_on_join":
+                hours = 21.67
+            buckets[max(buckets)]["hours_played"] = hours
+            if before_delivery and outcome == "incomplete_year":
+                buckets.pop(min(buckets))
+            if before_delivery and outcome == "stats_error":
+                return httpx2.Response(503)
+            data = {"kills": {"steam_id": sid}, "playTime": {"total": hours, "stats": buckets}}
         else:
             records = {
                 "kill-feed": feed,
@@ -147,6 +179,17 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                 async with sessions.begin() as db:
                     job = await db.get(CollectionJob, (project, sid), with_for_update=True)
                     await collect(db, client, job, settings)
+            if outcome == "protected_on_join":
+                async with sessions() as db:
+                    assert (await db.get(Player, (project, sid))).is_whitelisted
+                    assert not await db.scalar(
+                        select(Decision.id).where(Decision.project_id == project)
+                    )
+                    job = await db.get(CollectionJob, (project, sid))
+                    assert job.due_at is None
+                assert f"/players/{sid}/kill-feed" not in requests
+                assert not submitted
+                return
             async with sessions.begin() as db:
                 row = (
                     await db.scalars(select(Decision).where(Decision.project_id == project))
@@ -172,7 +215,27 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     for observation in observations
                     if observation.source == "checks"
                 ) == {"total": 5}
-            if outcome in {"new_session", "other_server", "became_licensed"}:
+            before_delivery = True
+            if outcome == "stats_error":
+                from app.clients.rustapp.exceptions import RustAppHTTPError
+
+                with pytest.raises(RustAppHTTPError):
+                    await deliver(sessions, client, project, settings, guard)
+                assert not submitted
+                return
+            if outcome in {"three_hours", "long_playtime", "incomplete_year"}:
+                await deliver(sessions, client, project, settings, guard)
+                async with sessions() as db:
+                    row = await db.scalar(select(Decision).where(Decision.project_id == project))
+                    player = await db.get(Player, (project, sid))
+                    assert row.state == "cancelled"
+                    assert player.is_whitelisted == (outcome != "incomplete_year")
+                    assert row.eligibility["outcome"] == (
+                        "incomplete_stats" if outcome == "incomplete_year" else "protected"
+                    )
+                assert not submitted
+                return
+            if outcome in {"new_session", "other_server", "became_licensed", "unknown_license"}:
                 if outcome == "new_session":
                     async with sessions.begin() as db:
                         await save_presence(db, project, {sid: "offline"}, (now - 1) * 1_000_000)
@@ -187,6 +250,8 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     profile["server_id"] = 164
                 if outcome == "became_licensed":
                     profile["last_no_license"] = False
+                if outcome == "unknown_license":
+                    profile["last_no_license"] = None
                 await deliver(sessions, client, project, settings, guard)
                 async with sessions() as db:
                     row = await db.scalar(select(Decision).where(Decision.project_id == project))
@@ -476,12 +541,12 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     PlayerSession(
                         project_id=project,
                         steam_id=steam_id,
-                        server_id=163,
+                        server_id=164,
                         connected_at=prior_start,
                         payload={
                             "project_id": project,
                             "steam_id": steam_id,
-                            "server_id": 163,
+                            "server_id": 164,
                             "connected_at": prior_start,
                             "joined_at": prior_start,
                             "disconnected_at": prior_end,
