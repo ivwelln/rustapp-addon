@@ -22,9 +22,9 @@ P03 использует время подтверждённого входа п
 Используются существующая PostgreSQL проекта и настроенные секреты панели и базы. Из корня репозитория:
 
 ```sh
-docker compose --profile tools build listener moderation ban-guard migrate
+docker compose --profile tools build api listener moderation ban-guard migrate
 docker compose --profile tools run --rm migrate
-docker compose --profile tools up -d listener moderation
+docker compose --profile tools up -d --wait api listener moderation
 ```
 
 По умолчанию система записывает правила и предполагаемые действия локально. Для отправки решений перед запуском задайте `APP_MODERATION_ENFORCE=true`. При смене настройки пересоздайте контейнер moderation. Каждый отправленный бан действует бессрочно на всех серверах проекта и блокирует SteamID и IP текущей игровой сессии. Если IP отсутствует или некорректен, обработчик помечает решение как `failed` и записывает причину в журнал. `APP_MODERATION_SERVER_ID` задаёт сервер наблюдения (по умолчанию №163).

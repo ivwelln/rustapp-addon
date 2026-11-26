@@ -148,7 +148,7 @@ tbody tr:hover td { background: var(--row-hover); }
 .country { white-space: nowrap; }
 .number { font-size: 14px; font-variant-numeric: tabular-nums; font-weight: 620; }
 .placeholder { color: var(--dim); }
-.group-divider td { background: var(--inset) !important; padding-block: 8px; color: var(--muted); font-size: 11px; }
+.roster .group-divider td { background: var(--inset); padding-block: 8px; color: var(--muted); font-size: 11px; text-align: left; }
 .status { white-space: nowrap; display: inline-flex; padding: 4px 8px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 11px; }
 .status[data-tone="cool"] { border-color: var(--cool-border); color: var(--accent); }
 .status[data-tone="good"] { border-color: var(--good-border); color: var(--good); }
@@ -188,7 +188,7 @@ canvas { display: block; width: 100%; height: 100%; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .metric { min-height: 94px; padding: 12px; }
   table { min-width: 685px; }
-  .roster :is(th, td):first-child { position: sticky; left: 0; z-index: 1; border-inline-end: 1px solid var(--line); }
+  .roster tr:not(.group-divider) > :is(th, td):first-child { position: sticky; left: 0; z-index: 1; border-inline-end: 1px solid var(--line); }
   .roster td:first-child { background: var(--surface); }
   .roster tr:hover td:first-child { background: var(--row-hover); }
 }
