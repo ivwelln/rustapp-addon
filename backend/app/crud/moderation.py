@@ -19,9 +19,7 @@ def now_ms() -> int:
     return time_ns() // 1_000_000
 
 
-async def enqueue(
-    db: AsyncSession, project: int, players: Iterable[str], *, seed: bool, resume: bool = False
-) -> None:
+async def enqueue(db: AsyncSession, project: int, players: Iterable[str], *, seed: bool) -> None:
     at = now_ms()
     steam_ids = sorted(set(players))
     if not steam_ids:
@@ -49,19 +47,13 @@ async def enqueue(
     if not values:
         return
     stmt = insert(CollectionJob).values(values)
-    update_values = {"due_at": func.least(CollectionJob.due_at, at)}
-    if not resume:
-        update_values["requested_at"] = at
     stmt = stmt.on_conflict_do_update(
         index_elements=["project_id", "steam_id"],
-        set_=update_values,
-        where=(
-            None
-            if resume
-            else CollectionJob.due_at.is_(None)
-            if seed
-            else CollectionJob.requested_at < at
-        ),
+        set_={
+            "due_at": func.least(CollectionJob.due_at, at),
+            "requested_at": func.greatest(at, CollectionJob.collected_at + 1),
+        },
+        where=CollectionJob.due_at.is_(None) if seed else CollectionJob.requested_at < at,
     )
     await db.execute(stmt)
 

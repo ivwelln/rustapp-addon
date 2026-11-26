@@ -14,12 +14,17 @@ from app.crud.player_data import save_ip, save_reports
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
 from app.crud.presence import PRESENT, observe_server, presence_is_current
 from app.models import CollectionJob, CombatKill, PlayerData, PlayerPresence, ReferenceBan
-from app.services.moderation.eligibility import cached_project_ms
+from app.services.moderation.eligibility import annual_ms, cached_project_ms
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
 from app.services.moderation.kill_feed import PAGE_LIMIT, update_coverage
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
-from app.services.research.playtime import DAY, HOUR, cache_days, daily_playtime, missing_range
+from app.services.moderation.playtime import (
+    WHITELIST_PLAYTIME_MS,
+    YEAR_MS,
+    known_sessions,
+    played_ms,
+)
+from app.services.research.playtime import HOUR, cache_days, daily_playtime
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +70,43 @@ async def cache_profile(db: AsyncSession, project: int, sid: str, data: dict) ->
     return True
 
 
+async def screen_playtime(db: AsyncSession, client: RustAppClient, job: CollectionJob) -> bool:
+    project, sid, end = job.project_id, job.steam_id, now_ms()
+    start = end - YEAR_MS + 1
+    params = {"time_from": start, "time_to": end}
+    try:
+        payload = await read(client, f"/players/{sid}/stats", **params)
+    except RustAppHTTPError as exc:
+        if exc.status_code not in (400, 404, 422):
+            raise
+        await archive(db, project, sid, "stats", {"http_status": exc.status_code}, params=params)
+        return False
+
+    observed = now_ms()
+    await archive(db, project, sid, "stats", payload, params=params)
+    try:
+        await cache_days(db, project, sid, payload, params, observed)
+    except RustAppResponseError:
+        logger.debug("Статистика без подтверждённых дневных часов | SteamID=%s", sid)
+        return False
+    try:
+        confirmed = annual_ms(payload, sid, start, end)
+    except RustAppResponseError:
+        # A partial response can still prove the minimum using days wholly inside the window.
+        confirmed = sum(
+            duration
+            for day, duration in daily_playtime(payload, sid).items()
+            if start <= day <= end
+        )
+    confirmed = max(confirmed, await cached_project_ms(db, project, sid, observed))
+    if confirmed < WHITELIST_PLAYTIME_MS:
+        return False
+    await whitelist_for_playtime(db, project, sid)
+    job.collected_at, job.due_at = observed, None
+    logger.info("Белый список по часам RustApp | SteamID=%s часы от %.2f", sid, confirmed / HOUR)
+    return True
+
+
 async def collect(
     db: AsyncSession, client: RustAppClient, job: CollectionJob, settings: ModerationSettings
 ) -> None:
@@ -100,6 +142,8 @@ async def collect(
         logger.info("Белый список: подтверждено игровое время | SteamID=%s", sid)
         job.collected_at, job.due_at = now, None
         return
+    if fresh and await screen_playtime(db, client, job):
+        return
     player_data = await db.get(PlayerData, (project, sid))
     cached = player_data.responses if player_data else {}
 
@@ -121,22 +165,12 @@ async def collect(
     now = now_ms()
     base = f"/players/{sid}/"
     for source, params in (
-        ("stats", {"time_from": now - 30 * 1440 * MINUTE, "time_to": now}),
         ("checks", {"page": 0, "limit": 1}),
         ("reports", {"page": 0, "limit": 20, "variant": "received"}),
         ("ip-history", {"page": 0, "limit": 20}),
     ):
         if (not fresh and source != "reports") or not needs_refresh(source):
             continue
-        if source == "stats":
-            previous_stats = cached.get("stats", {})
-            if previous_stats.get(
-                "observed_at", 0
-            ) >= now // DAY * DAY and "playTime" in previous_stats.get("payload", {}):
-                continue
-            gap = await missing_range(db, project, sid, now)
-            if gap and gap["time_to"] - gap["time_from"] > 30 * DAY:
-                params = {"time_from": gap["time_from"], "time_to": now}
         try:
             payload = await read(client, base + source, **params)
         except RustAppHTTPError as exc:
@@ -160,30 +194,6 @@ async def collect(
                 ],
             }
         await archive(db, project, sid, source, payload, params=params)
-        if source == "stats":
-            try:
-                observed = now_ms()
-                await cache_days(db, project, sid, payload, params, observed)
-                current_days = daily_playtime(payload, sid)
-                confirmed = sum(
-                    duration
-                    for day, duration in current_days.items()
-                    if observed - 365 * DAY <= day <= observed
-                )
-                if (
-                    max(confirmed, await cached_project_ms(db, project, sid, observed))
-                    >= WHITELIST_PLAYTIME_MS
-                ):
-                    await whitelist_for_playtime(db, project, sid)
-                    job.collected_at, job.due_at = observed, None
-                    logger.info(
-                        "Белый список по часам RustApp | SteamID=%s часы от %.2f",
-                        sid,
-                        confirmed / HOUR,
-                    )
-                    return
-            except RustAppResponseError:
-                logger.debug("Статистика без подтверждённых дневных часов | SteamID=%s", sid)
         if source == "reports":
             await save_reports(db, project, sid, results(payload))
         if source == "ip-history":
