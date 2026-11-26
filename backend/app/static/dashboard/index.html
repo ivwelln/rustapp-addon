@@ -10,13 +10,17 @@
   <link rel="icon" href="/dashboard-assets/rustapp.ico">
   <link rel="stylesheet" href="/dashboard-assets/dashboard.css">
   <script src="/dashboard-assets/dashboard.js" defer></script>
+  <script type="module" src="/dashboard-assets/rustapp-logo.js"></script>
 </head>
 <body>
   <a class="skip-link button-sm" href="#workspace">К списку игроков</a>
   <header class="topbar">
     <nav class="bar-content" aria-label="Навигация по панели">
       <a href="/" class="brand body-4" aria-current="page">
-        <img src="/dashboard-assets/rustapp.ico" width="24" height="24" alt="">
+        <span id="rustapp-logo" class="brand-logo" aria-hidden="true">
+          <span class="brand-logo-mark"></span>
+          <canvas></canvas>
+        </span>
         RustApp
       </a>
       <a class="caption-1" href="#workspace">Мониторинг</a>

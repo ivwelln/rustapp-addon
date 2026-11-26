@@ -82,7 +82,20 @@ button, .rustapp-player-link { transition: transform 300ms var(--curve); }
 .bar-content a { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 8px; color: var(--muted); }
 .bar-content a:hover { background: var(--raised); color: var(--text); }
 .bar-content .brand { color: var(--text); }
-.brand img { display: block; }
+.brand-logo {
+  position: relative; display: block; flex: 0 0 34px; width: 34px; height: 34px;
+  overflow: hidden; border-radius: 28%;
+  background: radial-gradient(ellipse at 26% 1%, #314036, transparent 66%),
+    linear-gradient(155deg, #1b2021, #090b0d 78%);
+  box-shadow: inset 0 0 0 1px #788e7a66, inset 0 2px 1px #ffffff19;
+}
+.brand-logo-mark, .brand-logo canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.brand-logo-mark {
+  background: linear-gradient(142deg, #e3f2d9 15%, #fbfcff 41%, #a5b6be 60%, #d6ee91 87%);
+  mask: url("./rustapp-mark.png") center / 100% 100% no-repeat;
+}
+.brand-logo[data-renderer="webgpu"] .brand-logo-mark,
+.brand-logo:not([data-renderer="webgpu"]) canvas { visibility: hidden; }
 .intro { margin-bottom: 24px; }
 .intro h1 {
   max-width: 680px; letter-spacing: -.05em;
@@ -232,6 +245,10 @@ canvas { width: 100%; height: 100%; display: block; }
 .roster tr[data-priority="true"]:hover td { background: var(--priority-hover); }
 .roster tr[data-priority="true"] td:first-child { box-shadow: inset 3px 0 var(--error); }
 .roster tr[data-priority="true"] :is(.combat-cell, .player-name) { color: var(--error); }
+@media (max-width: 380px) {
+  .bar-content a { padding-inline: 7px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   button, .rustapp-player-link { transition: none; }
   .roster-loading span, #decision-card[open] { animation: none; }
