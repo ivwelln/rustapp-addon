@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex">
   <meta name="description" content="Игроки, решения модерации и статистика проекта RustApp.">
   <title>Мониторинг RustApp</title>
   <link rel="icon" href="/dashboard-assets/rustapp.ico">
@@ -11,101 +12,116 @@
   <script src="/dashboard-assets/dashboard.js" defer></script>
 </head>
 <body>
+  <a class="skip-link button-sm" href="#workspace">К списку игроков</a>
   <header class="topbar">
-    <div class="shell bar-content">
-      <a href="/" class="brand">
-        <img class="brand-icon" src="/dashboard-assets/rustapp.ico" width="28" height="28" alt="">
-        <span>RustApp <small>Мониторинг</small></span>
+    <nav class="bar-content" aria-label="Навигация по панели">
+      <a href="/" class="brand body-4" aria-current="page">
+        <img src="/dashboard-assets/rustapp.ico" width="24" height="24" alt="">
+        RustApp
       </a>
-      <div class="connection" id="connection" data-state="wait" role="status">
-        <span id="connection-label">Подключение</span>
-      </div>
-    </div>
+      <a class="caption-1" href="#workspace">Мониторинг</a>
+      <a class="caption-1" href="#rules">Правила</a>
+    </nav>
   </header>
+  <noscript><p class="notice">Для живых данных включите JavaScript.</p></noscript>
   <main class="shell">
     <div class="intro">
-      <div><h1>Игроки и модерация</h1><p class="project" id="project-meta"></p></div>
+      <div>
+        <h1>Игроки и модерация</h1>
+        <div class="intro-meta caption-2">
+          <p id="project-meta"></p>
+          <p class="connection" id="connection" data-state="wait" role="status">
+            <span id="connection-label">Подключение</span>
+          </p>
+        </div>
+      </div>
       <button id="refresh" class="refresh" type="button">Обновить</button>
     </div>
-    <p id="error" class="notice" role="status" hidden></p>
-
-    <section class="metrics" aria-label="Сводка">
-      <article class="panel metric">
-        <h2>На серверах</h2><strong id="online-total">…</strong>
-        <p id="online-detail">Онлайн и AFK</p>
-      </article>
-      <article class="panel metric">
-        <h2>Очередь проверок</h2><strong id="queue">…</strong>
-        <p id="ready">Готовы к проверке: …</p>
-      </article>
-      <article class="panel metric">
-        <h2>Белый список</h2><strong id="trusted">…</strong>
-        <p id="trusted-detail">Аккаунтов на проекте</p>
-      </article>
-      <article class="panel metric">
-        <h2>Лимит автобанов</h2><strong id="guard">…</strong>
-        <p id="guard-status">Занято мест</p>
-      </article>
-    </section>
-
-    <section class="panel activity" aria-labelledby="activity-title">
-      <div class="panel-head">
-        <div><h2 id="activity-title">Игроки на серверах</h2><p id="updated">Ожидаем данные</p></div>
-        <div class="switch" role="group" aria-label="Раздел">
-          <button type="button" data-tab="players" aria-pressed="true">Игроки</button>
-          <button type="button" data-tab="decisions" aria-pressed="false">Решения</button>
+    <p id="error" class="notice body-6" role="status" hidden></p>
+    <div class="workspace" id="workspace">
+      <section class="panel activity" aria-labelledby="activity-title">
+        <div class="panel-head">
+          <div><h2 id="activity-title">Игроки на серверах</h2><p id="updated">Ожидаем данные</p></div>
+          <div class="switch" role="group" aria-label="Раздел">
+            <button type="button" data-tab="players" aria-pressed="true">Игроки</button>
+            <button type="button" data-tab="decisions" aria-pressed="false">Решения</button>
+          </div>
         </div>
-      </div>
-      <div class="table-tools">
-        <div class="filters" id="filters" role="group" aria-label="Статус игрока">
-          <button type="button" data-status="all" aria-pressed="true">Все</button>
-          <button type="button" data-status="online" aria-pressed="false">Онлайн</button>
-          <button type="button" data-status="afk" aria-pressed="false">AFK</button>
+        <div class="table-tools">
+          <div class="filters" id="filters" role="group" aria-label="Статус игрока">
+            <button type="button" data-status="all" aria-pressed="true">Все</button>
+            <button type="button" data-status="online" aria-pressed="false">Онлайн</button>
+            <button type="button" data-status="afk" aria-pressed="false">AFK</button>
+          </div>
+          <input id="search" type="search" placeholder="Имя или SteamID" aria-label="Поиск игроков">
         </div>
-        <input id="search" type="search" placeholder="Имя или SteamID" aria-label="Поиск игроков">
-      </div>
-      <div class="table-scroll">
-        <table><thead id="columns"></thead><tbody id="rows"></tbody></table>
-      </div>
-      <p id="empty" class="table-empty">Загружаем данные…</p>
-      <div class="table-footer" id="roster-footer" hidden>
-        <span id="visible-count"></span>
-        <span>Убийства за 24 ч по собранным килллогам</span>
-      </div>
-    </section>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Таблица мониторинга">
+          <table><thead id="columns"></thead><tbody id="rows"></tbody></table>
+        </div>
+        <div id="roster-loading" class="roster-loading" role="status" aria-label="Загружаем данные">
+          <span></span><span></span><span></span>
+        </div>
+        <p id="empty" class="table-empty" hidden>Загружаем данные…</p>
+        <div class="table-footer" id="roster-footer" hidden>
+          <span id="visible-count"></span>
+          <span>Убийства за 24 ч по собранным килллогам</span>
+        </div>
+      </section>
 
-    <section class="panel traffic" aria-labelledby="traffic-title">
-      <div class="panel-head">
-        <div><h2 id="traffic-title">Запросы к RustApp</h2><p>Попытки обращений по минутам</p></div>
-        <div class="traffic-total"><strong id="requests">…</strong><span>за последний час</span></div>
-      </div>
-      <div class="plot">
-        <canvas id="chart" aria-label="Количество запросов за последние 60 минут" role="img"></canvas>
-        <p id="chart-empty" hidden>За последний час запросов не было</p>
-      </div>
-      <div class="axis" aria-hidden="true"><span>−60 мин</span><span>−30 мин</span><span>Сейчас</span></div>
-    </section>
-    <section class="panel archive" aria-labelledby="archive-title">
-      <h2 id="archive-title">Записи в базе</h2>
-      <dl class="archive-totals">
-        <div><dt>Игроки</dt><dd id="stored-players">…</dd></div>
-        <div><dt>Убийства</dt><dd id="stored-kills">…</dd></div>
-      </dl>
-    </section>
-    <section class="rules-guide" aria-labelledby="rules-title">
+      <aside class="sidebar" aria-label="Статистика проекта">
+        <section class="panel metrics" aria-label="Сводка">
+          <article class="metric">
+            <h2>На серверах</h2><strong id="online-total">…</strong>
+            <p id="online-detail">Онлайн и AFK</p>
+          </article>
+          <article class="metric">
+            <h2>Очередь проверок</h2><strong id="queue">…</strong>
+            <p id="ready">Готовы к проверке: …</p>
+          </article>
+          <article class="metric">
+            <h2>Белый список</h2><strong id="trusted">…</strong>
+            <p id="trusted-detail">Аккаунтов на проекте</p>
+          </article>
+          <article class="metric">
+            <h2>Лимит автобанов</h2><strong id="guard">…</strong>
+            <p id="guard-status">Занято мест</p>
+          </article>
+        </section>
+
+        <section class="panel traffic" aria-labelledby="traffic-title">
+          <div class="panel-head">
+            <h2 id="traffic-title">Запросы к RustApp</h2>
+            <div class="traffic-total"><strong id="requests">…</strong><span>за последний час</span></div>
+          </div>
+          <div class="plot">
+            <canvas id="chart" aria-label="Количество запросов за последние 60 минут" role="img"></canvas>
+            <p id="chart-empty" hidden>За последний час запросов не было</p>
+          </div>
+          <div class="axis" aria-hidden="true"><span>−60 мин</span><span>−30 мин</span><span>Сейчас</span></div>
+        </section>
+        <section class="panel archive" aria-labelledby="archive-title">
+          <h2 id="archive-title">Записи в базе</h2>
+          <dl class="archive-totals">
+            <div><dt>Игроки</dt><dd id="stored-players">…</dd></div>
+            <div><dt>Убийства</dt><dd id="stored-kills">…</dd></div>
+          </dl>
+        </section>
+      </aside>
+    </div>
+    <section class="rules-guide" id="rules" aria-labelledby="rules-title">
       <h2 id="rules-title">Правила модерации</h2>
-      <p>Пороги по умолчанию для пиратских аккаунтов вне белого списка.</p>
+      <p class="body-6">Пороги по умолчанию для пиратских аккаунтов вне белого списка.</p>
       <dl class="rules-list">
         <div><dt><span>P01</span> Дата регистрации Steam</dt><dd>Фиксирует разницу до 60 секунд с датой регистрации ранее заблокированного аккаунта. Самостоятельно бан не выдаёт.</dd></div>
         <div><dt><span>P02</span> Совпадение после недавнего бана</dt><dd>Использует совпадение P01, если исходный бан выдан не более чем за час до появления новичка на проекте. Для автобана у обоих правил должно быть включено действие «бан».</dd></div>
-        <div><dt><span>P03</span> Серия сразу после входа</dt><dd>Закрытый Steam-профиль без даты регистрации и три разные жертвы за первые 10 минут первой игровой сессии.</dd></div>
-        <div><dt><span>P04</span> Вход после бана на том же сервере</dt><dd>Закрытый Steam-профиль без даты регистрации и подключение новичка в течение 15 минут после бана другого пиратского аккаунта на этом сервере.</dd></div>
+        <div><dt><span>P03</span> Серия сразу после входа</dt><dd>Закрытый профиль Steam без даты регистрации и три разные жертвы за первые 10 минут первой игровой сессии.</dd></div>
+        <div><dt><span>P04</span> Вход после бана на том же сервере</dt><dd>Закрытый профиль Steam без даты регистрации и подключение новичка в течение 15 минут после бана другого пиратского аккаунта на этом сервере.</dd></div>
         <div><dt><span>P05</span> Убийства в голову с дистанции</dt><dd>Три разные жертвы убиты в голову с расстояния от 50 метров за 30 минут.</dd></div>
         <div><dt><span>P06</span> Попадания только в голову</dt><dd>Три разные жертвы за 30 минут. Каждая убита в голову, получила минимум два попадания с уроном, и все они пришлись в голову.</dd></div>
         <div><dt><span>P07</span> Доля убийств в голову</dt><dd>За 30 минут минимум пять убийств с расстояния от 20 метров, не менее 80% в голову. Полнота ленты за это окно должна быть подтверждена.</dd></div>
-        <div><dt><span>P09</span> Серия в первый час на проекте</dt><dd>Три разные жертвы за любое 30-минутное окно в первый час после создания профиля на проекте.</dd></div>
+        <div><dt><span>P09</span> Серия в первый час на проекте</dt><dd>Три разные жертвы за любые 30 минут в первый час после создания профиля на проекте.</dd></div>
       </dl>
-      <p>В правилах P05, P06 и P07 учитываются винтовки, пистолеты-пулемёты и пулемёты из списка проекта.</p>
+      <p>В правилах P05, P06 и P07 учитываются винтовки, ПП и пулемёты из списка проекта.</p>
     </section>
   </main>
   <dialog id="decision-card" aria-labelledby="decision-title">

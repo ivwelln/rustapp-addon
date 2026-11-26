@@ -60,7 +60,13 @@ async def page() -> FileResponse:
 
 @router.get("/dashboard-assets/{name}", include_in_schema=False)
 async def asset(name: str) -> FileResponse:
-    if name not in {"dashboard.css", "dashboard.js", "rustapp.ico"}:
+    if name not in {
+        "dashboard.css",
+        "dashboard.js",
+        "rustapp.ico",
+        "manrope-latin.woff2",
+        "manrope-cyrillic.woff2",
+    }:
         raise HTTPException(status_code=404)
     return FileResponse(ASSETS / name, headers=HEADERS)
 
