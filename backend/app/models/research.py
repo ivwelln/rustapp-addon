@@ -20,7 +20,8 @@ class PlayerPlaytime(Base):
 
     project_id: Mapped[int] = mapped_column(primary_key=True)
     steam_id: Mapped[str] = mapped_column(Text, primary_key=True)
-    observed_ms: Mapped[int | None] = mapped_column(BigInteger)
+    annual_ms: Mapped[int | None] = mapped_column(BigInteger)
+    annual_checked_at: Mapped[int | None] = mapped_column(BigInteger)
     calculated_at: Mapped[int] = mapped_column(BigInteger, server_default="0")
     next_calculation: Mapped[int] = mapped_column(BigInteger, server_default="0")
     first_join_at: Mapped[int | None] = mapped_column(BigInteger)

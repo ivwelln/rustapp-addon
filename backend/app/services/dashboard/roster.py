@@ -84,6 +84,10 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
 
     name = profile_field("steam_name")
     trusted = func.coalesce(Player.is_whitelisted, False)
+    use_annual = PlayerPlaytime.annual_checked_at.is_not(None) & (
+        (PlayerPlaytime.project_days < 365)
+        | (PlayerPlaytime.annual_checked_at >= func.coalesce(PlayerPlaytime.project_day_end, 0))
+    )
     last_feed_at = PlayerData.responses["kill-feed"]["observed_at"].astext.cast(BigInteger)
     known_zero = case((last_feed_at.between(recent, now_ms), 0))
     kill_count = func.coalesce(kills.c.count, known_zero)
@@ -121,10 +125,14 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 profile_field("ip_details", "country_name").label("country_name"),
                 kill_count.label("kills"),
                 death_count.label("deaths"),
-                PlayerPlaytime.observed_ms.label("observed_project_ms"),
-                PlayerPlaytime.project_ms.label("project_played_ms"),
-                PlayerPlaytime.project_days.label("playtime_days"),
-                PlayerPlaytime.project_day_end.label("playtime_as_of"),
+                case((use_annual, PlayerPlaytime.annual_ms), else_=PlayerPlaytime.project_ms).label(
+                    "project_played_ms"
+                ),
+                case((use_annual, 365), else_=PlayerPlaytime.project_days).label("playtime_days"),
+                case(
+                    (use_annual, PlayerPlaytime.annual_checked_at),
+                    else_=PlayerPlaytime.project_day_end,
+                ).label("playtime_as_of"),
             )
             .select_from(PlayerPresence)
             .outerjoin(

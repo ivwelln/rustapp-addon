@@ -123,8 +123,10 @@ function rosterRow(record) {
   const hours = record.project_played_ms == null ? "—"
     : (record.playtime_days < 365 ? "≥ " : "") + number.format(record.project_played_ms / 3600000);
   const playtime = element("td", hours, "number");
-  const local = record.observed_project_ms == null ? "—" : number.format(record.observed_project_ms / 3600000);
-  playtime.title = `Все серверы проекта. RustApp вернул данные за ${record.playtime_days || 0} из 365 дней. По нашим наблюдениям на проекте — ${local} ч.`;
+  const asOf = record.playtime_as_of && hours !== "—" ? new Date(record.playtime_as_of).toLocaleString("ru-RU") : null;
+  playtime.title = asOf
+    ? `Часы RustApp по всем серверам проекта на ${asOf}. Данные за ${record.playtime_days} из 365 дней.`
+    : "Годовые часы RustApp пока неизвестны.";
   if (record.trained) playtime.title += " Исследовательский срез готов.";
   row.append(identity, element("td", record.steam_id, "steam"), whitelist,
     valueCell(record.provider || null), country, playtime, combat);

@@ -10,7 +10,7 @@ from app.crud.moderation import archive, now_ms
 from app.crud.players import whitelist_for_playtime
 from app.models import Decision, PlaytimeDay
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, YEAR_MS
-from app.services.research.playtime import DAY, HOUR, cache_days, daily_playtime
+from app.services.research.playtime import DAY, HOUR, cache_days, daily_playtime, save_annual
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,7 @@ async def verify_ban_hours(db: AsyncSession, client: RustAppClient, decision: De
         return False
     await archive(db, project, sid, "research-stats-window", {"params": params, "response": raw})
     await cache_days(db, project, sid, raw, params, now_ms())
+    await save_annual(db, project, sid, duration, end)
     protected = duration >= WHITELIST_PLAYTIME_MS
     decision.eligibility = {
         "checked_at": end,

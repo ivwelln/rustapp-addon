@@ -23,6 +23,7 @@ from app.models import (
     Decision,
     Observation,
     Player,
+    PlayerPlaytime,
     PlayerSession,
     ReferenceBan,
 )
@@ -46,6 +47,7 @@ from app.services.moderation.collect import collect
         "unknown_license",
         "three_hours",
         "protected_on_join",
+        "protected_on_recheck",
         "long_playtime",
         "incomplete_year",
         "stats_error",
@@ -134,6 +136,8 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
             )
             if outcome == "protected_on_join":
                 hours = 21.67
+            if outcome == "protected_on_recheck":
+                hours = 3 if before_delivery else 2.5
             buckets[max(buckets)]["hours_played"] = hours
             if before_delivery and outcome == "incomplete_year":
                 buckets.pop(min(buckets))
@@ -189,6 +193,23 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     assert job.due_at is None
                 assert f"/players/{sid}/kill-feed" not in requests
                 assert not submitted
+                return
+            if outcome == "protected_on_recheck":
+                assert requests.count(f"/players/{sid}/stats") == 1
+                async with sessions.begin() as db:
+                    job = await db.get(CollectionJob, (project, sid))
+                    cache = await db.get(PlayerPlaytime, (project, sid))
+                    assert cache.annual_ms == 9_000_000
+                    assert job.playtime_due_at == cache.annual_checked_at + 1_800_000
+                    before_delivery = True
+                    requests.clear()
+                    job.playtime_due_at = now_ms() - 1
+                    await collect(db, client, job, settings)
+                    await db.refresh(cache)
+                    assert cache.annual_ms == 10_800_000
+                    assert (await db.get(Player, (project, sid))).is_whitelisted
+                    assert job.due_at is None
+                    assert requests == [f"/players/{sid}/stats"]
                 return
             async with sessions.begin() as db:
                 row = (
@@ -440,7 +461,7 @@ def test_partial_ban_does_not_cover_requested_ban(changed_field):
     [
         "snapshot_license",
         "profile_license",
-        "playtime",
+        "observed_playtime",
         "archived_playtime",
         "under_limit",
         "stale_listener",
@@ -520,7 +541,9 @@ async def test_whitelist_stops_player_requests(trust_reason):
         # Simulate a job already queued before a newer snapshot marks the player as trusted.
         async with sessions.begin() as db:
             await enqueue(db, project, [steam_id], seed=False)
-            started_at = joined_at if trust_reason in {"playtime", "stale_listener"} else now - 500
+            started_at = (
+                joined_at if trust_reason in {"observed_playtime", "stale_listener"} else now - 500
+            )
             confirmed_at = now if trust_reason != "stale_listener" else started_at + 1000
             await confirm_presence_connection(db, project, confirmed_at)
             await save_presence(
@@ -581,7 +604,7 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     assert not player.is_whitelisted
                     assert data is None and requests == []
                     return
-                if trust_reason == "under_limit":
+                if trust_reason in {"under_limit", "observed_playtime", "archived_playtime"}:
                     assert not player.is_whitelisted
                     assert set(data.responses) == {
                         "details",
@@ -595,6 +618,10 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     assert (await db.get(PlayerReport, (project, 33))).steam_id == steam_id
                     assert await db.get(PlayerIP, (project, steam_id, ip))
                     assert await db.get(PlayerIP, (project, steam_id, "192.0.2.99")) is None
+                    assert job.playtime_due_at > now_ms()
+                    requests.clear()
+                    await collect(db, RustAppClient(http), job, ModerationSettings())
+                    assert requests == ["kill-feed"]
                     # A new entry rechecks annual hours while short-lived detail data stays cached.
                     job.requested_at = now_ms() + 100
                     requests.clear()
@@ -602,22 +629,15 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     assert requests == ["stats", "kill-feed"]
                 else:
                     assert player.is_whitelisted and job.due_at is None
-                    expected = (
-                        "playtime"
-                        if trust_reason in {"playtime", "archived_playtime"}
-                        else "license"
-                    )
-                    assert player.whitelist_reason == expected
+                    assert player.whitelist_reason == "license"
                     expected_requests = {
                         "snapshot_license": [],
                         "profile_license": ["stats", "details"],
-                        "playtime": [],
-                        "archived_playtime": [],
                     }
                     assert requests == expected_requests[trust_reason]
                     await enqueue(db, project, [steam_id], seed=False)
                     assert job.due_at is None
-            if trust_reason != "under_limit":
+            if trust_reason in {"snapshot_license", "profile_license"}:
                 requests.clear()
                 async with sessions.begin() as db:
                     await sync_bans(db, RustAppClient(http), project)

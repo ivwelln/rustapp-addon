@@ -1,24 +1,33 @@
 from decimal import Decimal
 from itertools import groupby
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.rustapp.exceptions import RustAppResponseError
-from app.crud.presence import PRESENT
-from app.models import Player, PlayerPlaytime, PlayerPresence, PlaytimeDay
-from app.services.moderation.playtime import YEAR_MS, known_sessions, played_ms
+from app.models import Player, PlayerPlaytime, PlaytimeDay
+from app.services.moderation.playtime import YEAR_MS
 
 DAY = 86_400_000
 HOUR = 3_600_000
 CONTROL_MS = 20 * HOUR
 
 
-def observed_hours_lower_bound(now: int):
-    # Up to this much recorded activity may since have rolled out of the year.
-    age = func.greatest(0, now - PlayerPlaytime.calculated_at)
-    return func.greatest(0, PlayerPlaytime.observed_ms - age)
+async def save_annual(
+    db: AsyncSession, project: int, sid: str, duration: int, checked_at: int
+) -> None:
+    statement = insert(PlayerPlaytime).values(
+        project_id=project, steam_id=sid, annual_ms=duration, annual_checked_at=checked_at
+    )
+    await db.execute(
+        statement.on_conflict_do_update(
+            index_elements=[PlayerPlaytime.project_id, PlayerPlaytime.steam_id],
+            set_={"annual_ms": duration, "annual_checked_at": checked_at},
+            where=PlayerPlaytime.annual_checked_at.is_(None)
+            | (PlayerPlaytime.annual_checked_at < checked_at),
+        )
+    )
 
 
 def daily_playtime(payload: dict, sid: str) -> dict[int, int]:
@@ -112,7 +121,7 @@ async def missing_range(db: AsyncSession, project: int, sid: str, now: int) -> d
 
 
 async def refresh_hours(db: AsyncSession, project: int, now: int) -> None:
-    # Seed cheaply, then recompute a bounded batch. Exits wake the local cache early.
+    # A new RustApp response or a new UTC day invalidates the summary of closed days.
     await db.execute(
         insert(PlayerPlaytime)
         .from_select(
@@ -132,35 +141,17 @@ async def refresh_hours(db: AsyncSession, project: int, now: int) -> None:
         )
         .on_conflict_do_nothing()
     )
-    rows = (
-        await db.execute(
-            select(PlayerPlaytime, PlayerPresence)
-            .outerjoin(
-                PlayerPresence,
-                (PlayerPresence.project_id == PlayerPlaytime.project_id)
-                & (PlayerPresence.steam_id == PlayerPlaytime.steam_id),
-            )
-            .where(
-                PlayerPlaytime.project_id == project,
-                or_(
-                    PlayerPlaytime.next_calculation <= now,
-                    (PlayerPresence.status == "offline")
-                    & (PlayerPresence.observed_at > PlayerPlaytime.calculated_at * 1_000_000),
-                ),
-            )
-            .order_by(PlayerPlaytime.next_calculation, PlayerPlaytime.steam_id)
-            .limit(64)
-            .with_for_update(of=PlayerPlaytime, skip_locked=True)
-        )
-    ).all()
+    rows = await db.scalars(
+        select(PlayerPlaytime)
+        .where(PlayerPlaytime.project_id == project, PlayerPlaytime.next_calculation <= now)
+        .order_by(PlayerPlaytime.next_calculation, PlayerPlaytime.steam_id)
+        .limit(64)
+        .with_for_update(skip_locked=True)
+    )
     end = now // DAY * DAY
-    for cache, presence in rows:
-        history = await known_sessions(db, project, cache.steam_id, presence, now)
-        cache.observed_ms = played_ms(history, server_id=None, now=now) if history else None
+    for cache in rows:
         cache.calculated_at = now
-        cache.next_calculation = (
-            now + 180_000 if presence and presence.status in PRESENT else end + DAY
-        )
+        cache.next_calculation = end + DAY
         count, total = (
             await db.execute(
                 select(

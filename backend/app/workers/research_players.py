@@ -21,7 +21,7 @@ from app.db.session import open_database_sessions
 from app.models import Player, PlayerPlaytime, PlaytimeDay, RustAppGate
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS
 from app.services.research.cases import sync_cases
-from app.services.research.playtime import DAY, observed_hours_lower_bound, refresh_hours
+from app.services.research.playtime import DAY, refresh_hours
 from app.services.research.queue import claim_hours, claim_source, hydrate, reschedule, store_work
 
 logger = logging.getLogger(__name__)
@@ -50,17 +50,12 @@ async def maintain(sessions, project: int, server: int) -> None:
             .group_by(PlaytimeDay.steam_id)
             .having(func.sum(PlaytimeDay.played_ms) >= WHITELIST_PLAYTIME_MS)
         )
-        observed = select(PlayerPlaytime.steam_id).where(
-            PlayerPlaytime.project_id == project,
-            observed_hours_lower_bound(now) >= WHITELIST_PLAYTIME_MS,
-            PlayerPlaytime.calculated_at >= now - 180_000,
-        )
         await db.execute(
             update(Player)
             .where(
                 Player.project_id == project,
                 ~Player.is_whitelisted,
-                (Player.steam_id.in_(total) | Player.steam_id.in_(observed)),
+                Player.steam_id.in_(total),
             )
             .values(is_whitelisted=True, whitelist_reason="playtime")
         )
