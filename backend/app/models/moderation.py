@@ -42,6 +42,16 @@ class CombatKill(Base):
     )
 
 
+class CombatDeath(Base):
+    __tablename__ = "combat_deaths"
+    __table_args__ = (Index("ix_death_dashboard", "project_id", "steam_id", "at"),)
+
+    project_id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    steam_id: Mapped[str] = mapped_column(Text)
+    at: Mapped[int] = mapped_column(BigInteger)
+
+
 class ReferenceBan(Base):
     __tablename__ = "rustapp_bans"
     project_id: Mapped[int] = mapped_column(primary_key=True)

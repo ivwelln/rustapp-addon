@@ -15,7 +15,15 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.ban_guard.quota import BAN_LIMIT, slots_used
 from app.crud.moderation import now_ms
-from app.models import CollectionJob, CombatKill, Decision, Player, PlayerPresence, RustAppRequest
+from app.models import (
+    CollectionJob,
+    CombatDeath,
+    CombatKill,
+    Decision,
+    Player,
+    PlayerPresence,
+    RustAppRequest,
+)
 from app.services.dashboard.decisions import decision_details, decision_summary
 from app.services.dashboard.roster import STEAM_AVATAR_HOSTS, online_players
 
@@ -45,7 +53,7 @@ async def dashboard_ready(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
     try:
         async with sessions() as db:
-            await db.execute(select(Decision.verdict).limit(0))
+            await db.execute(select(CombatDeath.event_id).limit(0))
     except (OSError, SQLAlchemyError):
         raise HTTPException(
             status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
@@ -172,7 +180,6 @@ async def read_snapshot(request: Request) -> dict:
     jobs = (
         select(
             CollectionJob.steam_id,
-            CollectionJob.collected_at,
             CollectionJob.due_at,
             PlayerPresence.status,
             Player.is_whitelisted,

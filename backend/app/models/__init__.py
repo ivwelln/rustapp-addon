@@ -1,5 +1,12 @@
 from app.db.base import Base
-from app.models.moderation import CollectionJob, CombatKill, Decision, Observation, ReferenceBan
+from app.models.moderation import (
+    CollectionJob,
+    CombatDeath,
+    CombatKill,
+    Decision,
+    Observation,
+    ReferenceBan,
+)
 from app.models.player import Player
 from app.models.player_data import (
     ObservedPlay,
@@ -23,6 +30,7 @@ __all__ = [
     "PlayerReport",
     "PlayerSession",
     "CollectionJob",
+    "CombatDeath",
     "CombatKill",
     "Decision",
     "Observation",

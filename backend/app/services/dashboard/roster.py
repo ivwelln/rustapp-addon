@@ -3,7 +3,15 @@ import re
 from sqlalchemy import BigInteger, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import CombatKill, Player, PlayerData, PlayerPresence, PlayerReport
+from app.models import (
+    CollectionJob,
+    CombatDeath,
+    CombatKill,
+    Player,
+    PlayerData,
+    PlayerPresence,
+    PlayerReport,
+)
 
 DAY_MS = 24 * 60 * 60 * 1000
 STEAM_AVATAR_HOSTS = (
@@ -20,17 +28,22 @@ STEAM_AVATAR_URL = re.compile(
 async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[dict]:
     recent = now_ms - DAY_MS
     present = PlayerPresence.status.in_(("online", "afk"))
-    kills = (
-        select(CombatKill.steam_id, func.count().label("count"))
-        .join(
-            PlayerPresence,
-            (PlayerPresence.project_id == CombatKill.project_id)
-            & (PlayerPresence.steam_id == CombatKill.steam_id),
+
+    def combat_counts(model: type[CombatKill] | type[CombatDeath]):
+        return (
+            select(model.steam_id, func.count().label("count"))
+            .join(
+                PlayerPresence,
+                (PlayerPresence.project_id == model.project_id)
+                & (PlayerPresence.steam_id == model.steam_id),
+            )
+            .where(model.project_id == project, model.at.between(recent, now_ms), present)
+            .group_by(model.steam_id)
+            .subquery()
         )
-        .where(CombatKill.project_id == project, CombatKill.at.between(recent, now_ms), present)
-        .group_by(CombatKill.steam_id)
-        .subquery()
-    )
+
+    kills = combat_counts(CombatKill)
+    deaths = combat_counts(CombatDeath)
 
     overview = PlayerData.responses["browse-full"]
     details = PlayerData.responses["details"]
@@ -54,6 +67,11 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
     name = profile_field("steam_name")
     trusted = func.coalesce(Player.is_whitelisted, False)
     last_feed_at = PlayerData.responses["kill-feed"]["observed_at"].astext.cast(BigInteger)
+    known_zero = case((last_feed_at.between(recent, now_ms), 0))
+    kill_count = func.coalesce(kills.c.count, known_zero)
+    death_count = func.coalesce(deaths.c.count, known_zero)
+    pirated = func.coalesce(PlayerPresence.is_pirated, Player.last_client_kind == "pirated", False)
+    priority = func.coalesce(~trusted & pirated & (kill_count > 5) & (death_count < 2), False)
     reports = PlayerData.responses["reports"]["payload"]
     stored_reports = (
         select(func.count())
@@ -71,6 +89,8 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 PlayerPresence.steam_id,
                 PlayerPresence.status,
                 trusted.label("trusted"),
+                priority.label("priority"),
+                func.greatest(CollectionJob.collected_at, last_feed_at).label("checked_at"),
                 name.label("name"),
                 profile_field("steam_avatar").label("steam_avatar"),
                 profile_field("steam_data", "avatar_medium_url").label("steam_avatar_medium"),
@@ -80,10 +100,8 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 profile_field("ip_details", "provider").label("provider"),
                 profile_field("ip_details", "country_code").label("country_code"),
                 profile_field("ip_details", "country_name").label("country_name"),
-                case(
-                    (kills.c.count.is_not(None), kills.c.count),
-                    (last_feed_at >= recent, 0),
-                ).label("kills"),
+                kill_count.label("kills"),
+                death_count.label("deaths"),
             )
             .select_from(PlayerPresence)
             .outerjoin(
@@ -96,9 +114,20 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 (PlayerData.project_id == PlayerPresence.project_id)
                 & (PlayerData.steam_id == PlayerPresence.steam_id),
             )
+            .outerjoin(
+                CollectionJob,
+                (CollectionJob.project_id == PlayerPresence.project_id)
+                & (CollectionJob.steam_id == PlayerPresence.steam_id),
+            )
             .outerjoin(kills, kills.c.steam_id == PlayerPresence.steam_id)
+            .outerjoin(deaths, deaths.c.steam_id == PlayerPresence.steam_id)
             .where(PlayerPresence.project_id == project, present)
-            .order_by(trusted, func.lower(name).asc().nulls_last(), PlayerPresence.steam_id)
+            .order_by(
+                priority.desc(),
+                trusted,
+                func.lower(name).asc().nulls_last(),
+                PlayerPresence.steam_id,
+            )
         )
     ).mappings()
     players = []

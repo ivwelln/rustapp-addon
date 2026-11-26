@@ -17,11 +17,15 @@ const verdicts = {
   inconclusive: "Недостаточно доказательств",
 };
 const evidenceTime = new Intl.DateTimeFormat("ru-RU", {dateStyle: "medium", timeStyle: "medium"});
+const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+const rowMotion = {duration: 360, easing: "cubic-bezier(.22, 1, .36, 1)"};
+const rowContents = new WeakMap();
 let snapshot = null;
+let snapshotReceivedAt = 0;
 let activeTab = "players";
 let presenceFilter = "all";
-let busy = false;
 let lastTableKey = null;
+let lastView = null;
 
 function element(tag, content, className) {
   const node = document.createElement(tag);
@@ -44,6 +48,7 @@ function valueCell(value) {
 function rosterRow(record) {
   const row = element("tr", "");
   row.dataset.trusted = String(record.trusted);
+  row.dataset.priority = String(record.priority);
   const identity = element("td", "");
   const identityGroup = element("div", "", "player-cell");
   const avatarGroup = element("div", "", "player-avatar-group");
@@ -84,7 +89,14 @@ function rosterRow(record) {
   nameLine.append(element("span", name, "player-name"), profile);
   const state = element("span", record.status === "afk" ? "AFK" : "Онлайн", "player-state");
   state.dataset.afk = record.status === "afk";
-  info.append(nameLine, state);
+  const checkAge = element("span", "", "check-age");
+  checkAge.setAttribute("role", "img");
+  const checkClock = element("span", "", "check-clock");
+  checkClock.setAttribute("aria-hidden", "true");
+  checkAge.append(checkClock, element("span", "", "check-seconds"));
+  const meta = element("div", "", "player-meta");
+  meta.append(state, checkAge);
+  info.append(nameLine, meta);
   identityGroup.append(avatarGroup, info);
   identity.append(identityGroup);
 
@@ -101,11 +113,15 @@ function rosterRow(record) {
   const countryLabel = (validCode ? regions.of(code) : null) || record.country_name;
   if (!countryLabel) country.classList.add("placeholder");
   country.append(document.createTextNode(countryLabel || "—"));
-  const kills = valueCell(record.kills == null ? null : number.format(record.kills));
-  kills.classList.add("number");
-  if (record.kills == null) kills.title = "Килллог за последние 24 часа ещё не собран";
+  const kills = record.kills == null ? "—" : number.format(record.kills);
+  const deaths = record.deaths == null ? "—" : number.format(record.deaths);
+  const combat = element("td", "", "combat-cell number");
+  combat.append(element("span", kills), element("span", "/", "combat-separator"),
+    element("span", deaths));
+  combat.title = record.priority ? "Вне белого списка: больше 5 убийств и меньше 2 смертей"
+    : "Убийства и смерти за 24 часа по собранным данным";
   row.append(identity, element("td", record.steam_id, "steam"), whitelist,
-    valueCell(record.provider || null), country, kills);
+    valueCell(record.provider || null), country, combat);
   return row;
 }
 
@@ -233,6 +249,79 @@ get("decision-review").addEventListener("submit", async (event) => {
   }
 });
 
+function updateCheckTimers() {
+  if (!snapshot) return;
+  const now = Date.parse(snapshot.updated_at) + performance.now() - snapshotReceivedAt;
+  for (const badge of get("rows").querySelectorAll(".check-age")) {
+    const checked = Number(badge.dataset.checkedAt);
+    const seconds = checked > 0 ? Math.max(0, Math.floor((now - checked) / 1000)) : null;
+    const label = seconds == null ? "—" : String(seconds);
+    const value = badge.querySelector(".check-seconds");
+    if (value.textContent === label) continue;
+    value.textContent = label;
+    badge.title = seconds == null ? "Автоматической проверки ещё не было"
+      : `С последней автоматической проверки: ${seconds} с`;
+    badge.setAttribute("aria-label", badge.title);
+  }
+}
+
+function syncActivityRows(items, animate) {
+  const body = get("rows");
+  const current = new Map(Array.from(body.rows, (row) => [row.dataset.key, row]));
+  const focusedKey = document.activeElement.closest("#rows tr")?.dataset.key;
+  const positions = new Map();
+  if (animate) {
+    for (const [key, row] of current) positions.set(key, row.getBoundingClientRect().top);
+  }
+  const rows = items.map(({key, record, divider}) => {
+    const signature = JSON.stringify({...record, checked_at: null});
+    let row = current.get(key);
+    current.delete(key);
+    if (!row || rowContents.get(row) !== signature) {
+      row?.remove();
+      if (divider) {
+        row = element("tr", "", "group-divider");
+        const title = element("td", "Белый список");
+        title.colSpan = 6;
+        row.append(title);
+      } else {
+        row = activeTab === "players" ? rosterRow(record) : decisionRow(record);
+      }
+      row.dataset.key = key;
+      rowContents.set(row, signature);
+    }
+    if (activeTab === "players" && !divider) {
+      row.querySelector(".check-age").dataset.checkedAt = record.checked_at ?? "";
+    }
+    return row;
+  });
+  for (const row of current.values()) row.remove();
+  let cursor = body.firstElementChild;
+  for (const row of rows) {
+    if (row === cursor) cursor = cursor.nextElementSibling;
+    else if (row.parentElement === body && body.moveBefore) body.moveBefore(row, cursor);
+    else body.insertBefore(row, cursor);
+  }
+  if (focusedKey && !body.contains(document.activeElement)) {
+    rows.find((row) => row.dataset.key === focusedKey)?.querySelector("a, button")?.focus({preventScroll: true});
+  }
+  if (!animate) return;
+  const viewport = body.closest(".table-scroll").getBoundingClientRect();
+  for (const row of rows) {
+    if (row.classList.contains("group-divider")) continue;
+    // Cancel only the movement this table started, before measuring the final position.
+    for (const animation of row.getAnimations()) animation.cancel();
+    const rect = row.getBoundingClientRect();
+    if (rect.bottom < viewport.top || rect.top > viewport.bottom) continue;
+    const start = positions.get(row.dataset.key);
+    if (start == null) {
+      row.animate([{opacity: .35, transform: "translateY(8px)"}, {opacity: 1, transform: "none"}], rowMotion);
+    } else if (Math.abs(start - rect.top) > 1) {
+      row.animate([{transform: `translateY(${start - rect.top}px)`}, {transform: "none"}], rowMotion);
+    }
+  }
+}
+
 function renderActivity() {
   const players = activeTab === "players";
   get("activity-title").textContent = players ? "Игроки на серверах" : "Решения модерации";
@@ -241,38 +330,40 @@ function renderActivity() {
   get("search").setAttribute("aria-label", get("search").placeholder);
   get("columns").closest("table").classList.toggle("roster", players);
   const headers = players
-    ? ["Имя", "SteamID", "Белый список", "Провайдер", "Страна", "Убийства"]
+    ? ["Имя", "SteamID", "Белый список", "Провайдер", "Страна", "K/D"]
     : ["SteamID", "Правило и основание", "Статус", "Срабатывание"];
   const query = get("search").value.trim().toLocaleLowerCase("ru");
   const records = snapshot?.[activeTab].filter((record) => (
     (!players || presenceFilter === "all" || record.status === presenceFilter)
     && (record.steam_id.includes(query) || (players && record.name?.toLocaleLowerCase("ru").includes(query)))
   )) || [];
-  const currentKey = JSON.stringify([snapshot?.project, activeTab, presenceFilter, query, records]);
+  const viewKey = JSON.stringify([snapshot?.project, activeTab, presenceFilter, query]);
+  const currentKey = JSON.stringify([viewKey, records]);
   if (currentKey !== lastTableKey) {
-    const heading = element("tr", "");
-    for (const title of headers) {
-      const cell = element("th", title);
-      cell.scope = "col";
-      heading.append(cell);
+    if (lastView?.tab !== activeTab) {
+      const heading = element("tr", "");
+      for (const title of headers) {
+        const cell = element("th", title);
+        cell.scope = "col";
+        heading.append(cell);
+      }
+      get("columns").replaceChildren(heading);
     }
-    get("columns").replaceChildren(heading);
-    const rows = [];
+    const items = [];
     let showDivider = players && records.some((record) => !record.trusted);
     for (const record of records) {
       if (showDivider && record.trusted) {
-        const group = element("tr", "", "group-divider");
-        const title = element("td", "Белый список");
-        title.colSpan = headers.length;
-        group.append(title);
-        rows.push(group);
+        items.push({key: "whitelist", divider: true});
         showDivider = false;
       }
-      rows.push(players ? rosterRow(record) : decisionRow(record));
+      items.push({key: players ? `player:${record.steam_id}` : `decision:${record.id}`, record});
     }
-    get("rows").replaceChildren(...rows);
+    const animate = !reducedMotion.matches && (lastView?.key === viewKey || !get("rows").hasChildNodes());
+    syncActivityRows(items, animate);
     lastTableKey = currentKey;
+    lastView = {key: viewKey, tab: activeTab};
   }
+  if (players) updateCheckTimers();
   const empty = get("empty");
   const waiting = !snapshot && get("connection").dataset.state !== "error";
   get("roster-loading").hidden = !waiting;
@@ -320,6 +411,7 @@ function renderChart() {
 function showSnapshot(data) {
   if (snapshot && data.updated_at < snapshot.updated_at) return;
   snapshot = data;
+  snapshotReceivedAt = performance.now();
   const afk = data.players.filter((player) => player.status === "afk").length;
   const trusted = data.players.filter((player) => player.trusted).length;
   get("online-total").textContent = number.format(data.players.length);
@@ -347,24 +439,6 @@ function setConnection(state, label, message = "") {
   get("error").hidden = !message;
   get("error").textContent = message;
   if (!snapshot) renderActivity();
-}
-
-async function refresh() {
-  if (busy) return;
-  busy = true;
-  get("refresh").disabled = true;
-  try {
-    const response = await fetch("/api/dashboard", {cache: "no-store", signal: AbortSignal.timeout(5000)});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Не удалось получить данные");
-    showSnapshot(data);
-    if (get("connection").dataset.state !== "ok") setConnection("wait", "Последний снимок");
-  } catch (error) {
-    setConnection("error", "Нет свежих данных", error.message);
-  } finally {
-    busy = false;
-    get("refresh").disabled = false;
-  }
 }
 
 const events = new EventSource("/api/dashboard/events");
@@ -399,6 +473,6 @@ for (const button of document.querySelectorAll("[data-status]")) {
   });
 }
 get("search").addEventListener("input", renderActivity);
-get("refresh").addEventListener("click", refresh);
+window.setInterval(updateCheckTimers, 1000);
 window.addEventListener("resize", renderChart);
 renderActivity();
