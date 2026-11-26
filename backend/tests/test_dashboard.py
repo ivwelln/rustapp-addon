@@ -10,7 +10,7 @@ from app.crud.moderation import now_ms
 from app.crud.player_data import save_response
 from app.crud.presence import save_presence
 from app.main import app
-from app.models import CombatKill, Decision, Player, PlayerReport
+from app.models import CollectionJob, CombatKill, Decision, Observation, Player, PlayerReport
 from app.services.dashboard.roster import DAY_MS, online_players
 
 
@@ -23,6 +23,7 @@ async def test_dashboard_is_local_and_assets_are_served():
         assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
         assert "https://avatars.akamai.steamstatic.com" in page.headers["content-security-policy"]
         assert "Правила модерации" in page.text and "P09" in page.text
+        assert 'id="refresh"' not in page.text
         assert (await client.get("/dashboard-assets/rustapp.ico")).content.startswith(
             b"\x00\x00\x01\x00"
         )
@@ -128,6 +129,116 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
         assert [player["avatar_url"] for player in roster] == [avatar_url, None]
         assert roster[0]["name"] == "Zeta" and roster[0]["provider"] == "Network"
         assert roster[0]["country_code"] == "RU" and "ip" not in roster[0]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+async def test_roster_prioritizes_only_eligible_pirates_with_observed_kd():
+    project = uuid4().int % (2**30) + 1
+    now = now_ms()
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    fixtures = [
+        ("Alpha", 6, 2, True, False),
+        ("Bravo", 5, 0, True, False),
+        ("Charlie", 6, 0, False, False),
+        ("Delta", 6, 0, None, False),
+        ("Echo", 6, None, True, False),
+        ("Tango", 6, 0, True, True),
+        ("Yankee", 6, 0, None, False),
+        ("Zulu", 6, 1, True, False),
+    ]
+
+    def event(event_id, victim, at, source_project=project):
+        return {
+            "id": event_id,
+            "project_id": source_project,
+            "created_at": at,
+            "target": {"steam_id": victim},
+        }
+
+    try:
+        async with sessions.begin() as db:
+            for index, (name, kills, deaths, pirate, trusted) in enumerate(fixtures):
+                steam_id = str(76561198000001240 + index)
+                await save_presence(
+                    db,
+                    project,
+                    {steam_id: "afk" if name == "Zulu" else "online"},
+                    (now - 10_000) * 1_000_000,
+                    server_info={steam_id: (163, pirate)},
+                )
+                db.add(
+                    Player(
+                        project_id=project,
+                        steam_id=steam_id,
+                        is_whitelisted=trusted,
+                        last_client_kind="pirated" if name in {"Charlie", "Yankee"} else "unknown",
+                    )
+                )
+                await save_response(db, project, steam_id, "browse-full", now, {"steam_name": name})
+                if deaths is not None:
+                    await save_response(
+                        db, project, steam_id, "kill-feed", now - 2_000, {"results": []}
+                    )
+                db.add_all(
+                    CombatKill(
+                        project_id=project,
+                        steam_id=steam_id,
+                        event_id=100 * index + kill,
+                        server_id=163,
+                        at=now - 4_000,
+                        facts={},
+                    )
+                    for kill in range(kills)
+                )
+                death_events = [
+                    event(1_000 + 100 * index + death, steam_id, now - 4_000)
+                    for death in range(deaths or 0)
+                ]
+                if name == "Zulu":
+                    db.add(
+                        CollectionJob(
+                            project_id=project,
+                            steam_id=steam_id,
+                            requested_at=now - 8_000,
+                            collected_at=now - 3_000,
+                        )
+                    )
+                    death_events += [
+                        death_events[0],
+                        event(2000, steam_id, now - DAY_MS - 1),
+                        event(2001, steam_id, now - 4_000, project + 1),
+                        {**event(2002, steam_id, now), "created_at": "invalid"},
+                    ]
+                for _ in range(2):
+                    db.add(
+                        Observation(
+                            project_id=project,
+                            steam_id=steam_id,
+                            source="kill-feed",
+                            observed_at=now - 2_000,
+                            payload={"results": death_events},
+                        )
+                    )
+        async with sessions() as db:
+            roster = await online_players(db, project, now)
+        assert [player["name"] for player in roster] == [
+            "Yankee",
+            "Zulu",
+            "Alpha",
+            "Bravo",
+            "Charlie",
+            "Delta",
+            "Echo",
+            "Tango",
+        ]
+        assert [player["name"] for player in roster if player["priority"]] == ["Yankee", "Zulu"]
+        assert roster[0]["deaths"] == 0
+        zulu = roster[1]
+        assert (zulu["kills"], zulu["deaths"], zulu["checked_at"]) == (6, 1, now - 2_000)
+        assert next(player for player in roster if player["name"] == "Echo")["deaths"] is None
     finally:
         await engine.dispose()
 
