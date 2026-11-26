@@ -38,6 +38,21 @@ async def local_dashboard(request: Request) -> None:
 router = APIRouter(dependencies=[Depends(local_dashboard)])
 
 
+@router.get("/ready", include_in_schema=False)
+async def dashboard_ready(request: Request) -> dict[str, str]:
+    sessions = getattr(request.app.state, "dashboard_sessions", None)
+    if sessions is None:
+        raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
+    try:
+        async with sessions() as db:
+            await db.execute(select(Decision.verdict).limit(0))
+    except (OSError, SQLAlchemyError):
+        raise HTTPException(
+            status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
+        ) from None
+    return {"status": "ready"}
+
+
 @router.get("/", include_in_schema=False)
 async def page() -> FileResponse:
     return FileResponse(ASSETS / "index.html", headers=HEADERS)
@@ -97,7 +112,7 @@ async def access_decision(
                 decision.verdict_note = body.note
                 decision.verdict_at = now_ms()
             return decision_details(decision)
-    except SQLAlchemyError:
+    except (OSError, SQLAlchemyError):
         raise HTTPException(
             status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
         ) from None
@@ -223,7 +238,7 @@ async def read_snapshot(request: Request) -> dict:
                 )
             ).all()
             used = await slots_used(db, project)
-    except SQLAlchemyError:
+    except (OSError, SQLAlchemyError):
         raise HTTPException(
             status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
         ) from None

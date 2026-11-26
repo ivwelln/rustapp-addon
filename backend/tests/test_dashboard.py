@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx2
@@ -29,6 +30,20 @@ async def test_dashboard_is_local_and_assets_are_served():
         assert (await client.get("/dashboard-assets/dashboard.css")).status_code == 200
         external = await client.get("/api/dashboard", headers={"Host": "other.example"})
         assert external.status_code == 403
+
+
+async def test_dashboard_reports_unavailable_when_database_connection_fails(monkeypatch):
+    @asynccontextmanager
+    async def disconnected():
+        raise OSError("test database connection failure")
+        yield
+
+    monkeypatch.setattr(app.state, "dashboard_sessions", disconnected, raising=False)
+    monkeypatch.setattr(app.state, "dashboard_project", 1, raising=False)
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(base_url="http://127.0.0.1", transport=transport) as client:
+        assert (await client.get("/ready")).status_code == 503
+        assert (await client.get("/api/dashboard")).status_code == 503
 
 
 @pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
@@ -180,6 +195,7 @@ async def test_decision_card_persists_local_verdict_and_shows_verified_reference
             path = f"/api/dashboard/decisions/{decision.id}"
         transport = httpx2.ASGITransport(app=app)
         async with httpx2.AsyncClient(base_url="http://127.0.0.1", transport=transport) as client:
+            assert (await client.get("/ready")).json() == {"status": "ready"}
             initial = await client.get(path)
             assert initial.status_code == 200
             snapshot = await client.get("/api/dashboard")
