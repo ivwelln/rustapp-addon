@@ -1,9 +1,20 @@
+import re
+
 from sqlalchemy import BigInteger, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import CombatKill, Player, PlayerData, PlayerPresence
+from app.models import CombatKill, Player, PlayerData, PlayerPresence, PlayerReport
 
 DAY_MS = 24 * 60 * 60 * 1000
+STEAM_AVATAR_HOSTS = (
+    "avatars.akamai.steamstatic.com",
+    "avatars.cloudflare.steamstatic.com",
+    "avatars.steamstatic.com",
+)
+STEAM_AVATAR_URL = re.compile(
+    rf"https://(?:{'|'.join(map(re.escape, STEAM_AVATAR_HOSTS))})/"
+    r"[0-9a-f]{40}(?:_(?:medium|full))?\.jpg"
+)
 
 
 async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[dict]:
@@ -43,6 +54,17 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
     name = profile_field("steam_name")
     trusted = func.coalesce(Player.is_whitelisted, False)
     last_feed_at = PlayerData.responses["kill-feed"]["observed_at"].astext.cast(BigInteger)
+    reports = PlayerData.responses["reports"]["payload"]
+    stored_reports = (
+        select(func.count())
+        .select_from(PlayerReport)
+        .where(
+            PlayerReport.project_id == PlayerPresence.project_id,
+            PlayerReport.steam_id == PlayerPresence.steam_id,
+        )
+        .correlate(PlayerPresence)
+        .scalar_subquery()
+    )
     rows = (
         await db.execute(
             select(
@@ -50,6 +72,11 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 PlayerPresence.status,
                 trusted.label("trusted"),
                 name.label("name"),
+                profile_field("steam_avatar").label("steam_avatar"),
+                profile_field("steam_data", "avatar_medium_url").label("steam_avatar_medium"),
+                reports["total"].label("report_total"),
+                reports.has_key("results").label("reports_fetched"),
+                stored_reports.label("stored_reports"),
                 profile_field("ip_details", "provider").label("provider"),
                 profile_field("ip_details", "country_code").label("country_code"),
                 profile_field("ip_details", "country_name").label("country_name"),
@@ -74,4 +101,19 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
             .order_by(trusted, func.lower(name).asc().nulls_last(), PlayerPresence.steam_id)
         )
     ).mappings()
-    return [dict(row) for row in rows]
+    players = []
+    for row in rows:
+        player = dict(row)
+        avatars = (player.pop("steam_avatar"), player.pop("steam_avatar_medium"))
+        player["avatar_url"] = next(
+            (url for url in avatars if url and STEAM_AVATAR_URL.fullmatch(url)), None
+        )
+        total = player.pop("report_total")
+        stored = player.pop("stored_reports")
+        fetched = player.pop("reports_fetched")
+        if type(total) is int and total >= 0:
+            player["reports"] = total
+        else:
+            player["reports"] = stored if stored or fetched else None
+        players.append(player)
+    return players

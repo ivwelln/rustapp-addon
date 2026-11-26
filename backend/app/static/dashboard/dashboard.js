@@ -46,17 +46,46 @@ function rosterRow(record) {
   row.dataset.trusted = String(record.trusted);
   const identity = element("td", "");
   const identityGroup = element("div", "", "player-cell");
-  const avatar = element("span", Array.from(record.name || "?")[0].toLocaleUpperCase("ru"), "avatar");
+  const avatarGroup = element("div", "", "player-avatar-group");
+  const avatar = element("span", Array.from(record.name?.trim() || "?")[0].toLocaleUpperCase("ru"), "avatar");
   avatar.setAttribute("aria-hidden", "true");
-  const info = element("div", "");
-  info.append(element("span", record.name || "Имя неизвестно", "player-name"));
-  const state = element("span", "", "player-state");
-  const dot = element("span", "", "player-dot");
-  dot.dataset.afk = record.status === "afk";
-  dot.setAttribute("aria-hidden", "true");
-  state.append(dot, document.createTextNode(record.status === "afk" ? "AFK" : "Онлайн"));
-  info.append(state);
-  identityGroup.append(avatar, info);
+  if (record.avatar_url) {
+    const image = element("img", "");
+    image.alt = "";
+    image.width = image.height = 32;
+    image.referrerPolicy = "no-referrer";
+    image.loading = "lazy";
+    image.addEventListener("error", () => image.remove(), {once: true});
+    image.src = record.avatar_url;
+    avatar.append(image);
+  }
+  const reportCount = record.reports == null ? "—" : number.format(record.reports);
+  const reports = element("span", reportCount, "report-count");
+  reports.dataset.positive = record.reports > 0;
+  reports.title = record.reports == null ? "Репорты ещё не собраны" : `Получено репортов: ${reportCount}`;
+  reports.setAttribute("role", "img");
+  reports.setAttribute("aria-label", reports.title);
+  avatarGroup.append(avatar, reports);
+
+  const info = element("div", "", "player-info");
+  const nameLine = element("div", "", "player-name-line");
+  const name = record.name || "Имя неизвестно";
+  const profile = element("a", "", "rustapp-player-link");
+  profile.href = `https://rustapp.io/${encodeURIComponent(snapshot.project)}/players?player=${encodeURIComponent(record.steam_id)}`;
+  profile.target = "_blank";
+  profile.rel = "noopener noreferrer";
+  profile.title = "Открыть в RustApp в новой вкладке";
+  profile.setAttribute("aria-label", `${profile.title} (${name})`);
+  const logo = element("img", "");
+  logo.alt = "";
+  logo.width = logo.height = 16;
+  logo.src = "/dashboard-assets/rustapp.ico";
+  profile.append(logo);
+  nameLine.append(element("span", name, "player-name"), profile);
+  const state = element("span", record.status === "afk" ? "AFK" : "Онлайн", "player-state");
+  state.dataset.afk = record.status === "afk";
+  info.append(nameLine, state);
+  identityGroup.append(avatarGroup, info);
   identity.append(identityGroup);
 
   const whitelist = element("td", "");
@@ -69,12 +98,6 @@ function rosterRow(record) {
   const code = (record.country_code || "").toUpperCase();
   const validCode = /^[A-Z]{2}$/.test(code);
   const country = element("td", "", "country");
-  if (validCode && code !== "ZZ") {
-    const flag = String.fromCodePoint(...Array.from(code, (letter) => letter.charCodeAt(0) + 127397));
-    const flagNode = element("span", flag, "country-flag");
-    flagNode.setAttribute("aria-hidden", "true");
-    country.append(flagNode);
-  }
   const countryLabel = (validCode ? regions.of(code) : null) || record.country_name;
   if (!countryLabel) country.classList.add("placeholder");
   country.append(document.createTextNode(countryLabel || "—"));
@@ -225,7 +248,7 @@ function renderActivity() {
     (!players || presenceFilter === "all" || record.status === presenceFilter)
     && (record.steam_id.includes(query) || (players && record.name?.toLocaleLowerCase("ru").includes(query)))
   )) || [];
-  const currentKey = JSON.stringify([activeTab, presenceFilter, query, records]);
+  const currentKey = JSON.stringify([snapshot?.project, activeTab, presenceFilter, query, records]);
   if (currentKey !== lastTableKey) {
     const heading = element("tr", "");
     for (const title of headers) {
@@ -274,7 +297,8 @@ function renderChart() {
   const values = snapshot.request_buckets;
   get("chart-empty").hidden = Math.max(...values) > 0;
   const max = Math.max(10, ...values);
-  ctx.strokeStyle = "#292f38";
+  const colors = getComputedStyle(canvas);
+  ctx.strokeStyle = colors.getPropertyValue("--chart-grid");
   for (let step = 0; step < 4; step += 1) {
     const y = 1 + (height - 2) * step / 3;
     ctx.beginPath();
@@ -283,7 +307,7 @@ function renderChart() {
     ctx.stroke();
   }
   const slot = width / values.length;
-  ctx.fillStyle = "#82a8f2";
+  ctx.fillStyle = colors.getPropertyValue("--chart-bars");
   values.forEach((value, index) => {
     const bar = (height - 4) * value / max;
     if (bar) ctx.fillRect(index * slot + 1, height - bar - 1, Math.max(1, slot - 2), bar);
@@ -297,12 +321,14 @@ function showSnapshot(data) {
   const afk = data.players.filter((player) => player.status === "afk").length;
   const trusted = data.players.filter((player) => player.trusted).length;
   get("online-total").textContent = number.format(data.players.length);
-  get("online-detail").textContent = `Онлайн ${data.players.length - afk} · AFK ${afk}`;
+  get("online-detail").textContent = `Онлайн: ${data.players.length - afk}, AFK: ${afk}`;
   get("queue").textContent = number.format(data.queue);
   get("ready").textContent = `Готовы к проверке: ${number.format(data.ready)}`;
   get("trusted").textContent = number.format(data.trusted);
   get("trusted-detail").textContent = `${trusted} сейчас на серверах`;
   get("requests").textContent = number.format(data.requests_hour);
+  get("stored-players").textContent = data.storage ? number.format(data.storage.players) : "—";
+  get("stored-kills").textContent = data.storage ? number.format(data.storage.kills) : "—";
   get("project-meta").textContent = `Проект №${data.project}`;
   get("guard").textContent = `${data.guard.used} / ${data.guard.limit}`;
   const exhausted = data.guard.used >= data.guard.limit;

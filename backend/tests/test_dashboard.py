@@ -9,7 +9,7 @@ from app.crud.moderation import now_ms
 from app.crud.player_data import save_response
 from app.crud.presence import save_presence
 from app.main import app
-from app.models import CombatKill, Decision, Player
+from app.models import CombatKill, Decision, Player, PlayerReport
 from app.services.dashboard.roster import DAY_MS, online_players
 
 
@@ -20,6 +20,11 @@ async def test_dashboard_is_local_and_assets_are_served():
         assert page.status_code == 200 and "Игроки и модерация" in page.text
         assert page.headers["cache-control"] == "no-store"
         assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+        assert "https://avatars.akamai.steamstatic.com" in page.headers["content-security-policy"]
+        assert "Правила модерации" in page.text and "P09" in page.text
+        assert (await client.get("/dashboard-assets/rustapp.ico")).content.startswith(
+            b"\x00\x00\x01\x00"
+        )
         assert (await client.get("/dashboard-assets/dashboard.js")).status_code == 200
         assert (await client.get("/dashboard-assets/dashboard.css")).status_code == 200
         external = await client.get("/api/dashboard", headers={"Host": "other.example"})
@@ -34,6 +39,7 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
     sessions = async_sessionmaker(engine)
     steam_ids = ["76561198000001230", "76561198000001231", "76561198000001232"]
     active, trusted, offline = steam_ids
+    avatar_url = f"https://avatars.akamai.steamstatic.com/{'a' * 40}_medium.jpg"
     try:
         async with sessions.begin() as db:
             await save_presence(
@@ -49,6 +55,7 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
                 now - 20,
                 {
                     "steam_name": "Unnamed",
+                    "steam_avatar": "https://untrusted.example/image.jpg",
                 },
             )
             await save_response(
@@ -60,6 +67,7 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
                 {
                     "player": {
                         "steam_name": "Zeta",
+                        "steam_data": {"avatar_medium_url": avatar_url},
                         "ip": "192.0.2.4",
                         "ip_details": {
                             "provider": "Network",
@@ -70,6 +78,12 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
                 },
             )
             await save_response(db, project, trusted, "browse-full", now, {"steam_name": "Alpha"})
+            await save_response(db, project, active, "reports", now, {"total": 25, "results": []})
+            db.add(
+                PlayerReport(
+                    project_id=project, steam_id=trusted, report_id=1, created_at=now, payload={}
+                )
+            )
             db.add_all(
                 [
                     CombatKill(
@@ -95,6 +109,8 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
         assert [player["steam_id"] for player in roster] == [active, trusted]
         assert [player["status"] for player in roster] == ["online", "afk"]
         assert [player["kills"] for player in roster] == [1, None]
+        assert [player["reports"] for player in roster] == [25, 1]
+        assert [player["avatar_url"] for player in roster] == [avatar_url, None]
         assert roster[0]["name"] == "Zeta" and roster[0]["provider"] == "Network"
         assert roster[0]["country_code"] == "RU" and "ip" not in roster[0]
     finally:
@@ -139,12 +155,35 @@ async def test_decision_card_persists_local_verdict_and_shows_verified_reference
                 },
             )
             db.add(decision)
+            db.add(Player(project_id=project, steam_id=steam_id))
+            db.add(
+                CombatKill(
+                    project_id=project,
+                    steam_id=steam_id,
+                    event_id=1,
+                    server_id=163,
+                    at=now,
+                    facts={},
+                )
+            )
+            db.add(
+                CombatKill(
+                    project_id=project + 1,
+                    steam_id=steam_id,
+                    event_id=1,
+                    server_id=163,
+                    at=now,
+                    facts={},
+                )
+            )
             await db.flush()
             path = f"/api/dashboard/decisions/{decision.id}"
         transport = httpx2.ASGITransport(app=app)
         async with httpx2.AsyncClient(base_url="http://127.0.0.1", transport=transport) as client:
             initial = await client.get(path)
             assert initial.status_code == 200
+            snapshot = await client.get("/api/dashboard")
+            assert snapshot.json()["storage"] == {"players": 1, "kills": 1}
             assert initial.json()["joined_at"] == now
             assert initial.json()["reference_ban_id"] == 22 and "№22" in initial.json()["reason"]
             assert "192.0.2.4" not in initial.text

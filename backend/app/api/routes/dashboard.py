@@ -15,15 +15,16 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.ban_guard.quota import BAN_LIMIT, slots_used
 from app.crud.moderation import now_ms
-from app.models import CollectionJob, Decision, Player, PlayerPresence, RustAppRequest
+from app.models import CollectionJob, CombatKill, Decision, Player, PlayerPresence, RustAppRequest
 from app.services.dashboard.decisions import decision_details, decision_summary
-from app.services.dashboard.roster import online_players
+from app.services.dashboard.roster import STEAM_AVATAR_HOSTS, online_players
 
 ASSETS = Path(__file__).resolve().parents[2] / "static" / "dashboard"
 HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
-        "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+        "img-src 'self' " + " ".join(f"https://{host}" for host in STEAM_AVATAR_HOSTS)
     ),
     "X-Content-Type-Options": "nosniff",
 }
@@ -44,7 +45,7 @@ async def page() -> FileResponse:
 
 @router.get("/dashboard-assets/{name}", include_in_schema=False)
 async def asset(name: str) -> FileResponse:
-    if name not in {"dashboard.css", "dashboard.js"}:
+    if name not in {"dashboard.css", "dashboard.js", "rustapp.ico"}:
         raise HTTPException(status_code=404)
     return FileResponse(ASSETS / name, headers=HEADERS)
 
@@ -182,13 +183,15 @@ async def read_snapshot(request: Request) -> dict:
                     ).select_from(jobs)
                 )
             ).one()
-            trusted = await db.scalar(
-                select(func.count())
-                .select_from(Player)
-                .where(
-                    Player.project_id == project,
-                    Player.is_whitelisted,
+            player_counts = (
+                await db.execute(
+                    select(func.count(), func.count().filter(Player.is_whitelisted))
+                    .select_from(Player)
+                    .where(Player.project_id == project)
                 )
+            ).one()
+            kill_count = await db.scalar(
+                select(func.count()).select_from(CombatKill).where(CombatKill.project_id == project)
             )
             timeline = dict(
                 (
@@ -231,7 +234,8 @@ async def read_snapshot(request: Request) -> dict:
         "queue": counts[0],
         "ready": counts[1],
         "afk": counts[2],
-        "trusted": trusted,
+        "trusted": player_counts[1],
+        "storage": {"players": player_counts[0], "kills": kill_count},
         "requests_hour": request_count,
         "request_buckets": [
             timeline.get(first_minute + timedelta(minutes=index), 0) for index in range(60)
