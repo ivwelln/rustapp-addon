@@ -101,19 +101,17 @@ async def claim_source(db: AsyncSession, project: int, server: int, now: int) ->
 
 
 async def claim_hours(db: AsyncSession, project: int, server: int, now: int) -> Work | None:
-    case_exists = (
-        select(ResearchCase.id)
-        .where(
-            ResearchCase.project_id == project,
-            ResearchCase.server_id == server,
-            ResearchCase.steam_id == PlayerPlaytime.steam_id,
-            ResearchCase.label.in_(ELIGIBLE),
-        )
-        .exists()
+    player_cases = select(ResearchCase.id).where(
+        ResearchCase.project_id == project,
+        ResearchCase.server_id == server,
+        ResearchCase.steam_id == PlayerPlaytime.steam_id,
+        ResearchCase.version == VERSION,
     )
+    selected = player_cases.where(ResearchCase.label.in_(ELIGIBLE)).exists()
+    awaiting = player_cases.where(ResearchCase.label == "awaiting_playtime").exists()
     online = PlayerPresence.status == "online"
     regular = (
-        online & (~Player.is_whitelisted | PlayerPlaytime.stats_checked_at.is_(None))
+        online & (~Player.is_whitelisted | ~selected)
         if await presence_is_current(db, project, now)
         else False
     )
@@ -133,7 +131,7 @@ async def claim_hours(db: AsyncSession, project: int, server: int, now: int) -> 
             PlayerPlaytime.project_id == project,
             Player.last_client_kind == "pirated",
             PlayerPlaytime.stats_after <= now,
-            or_(regular, case_exists & PlayerPlaytime.stats_checked_at.is_(None)),
+            or_(regular, (selected | awaiting) & PlayerPlaytime.stats_checked_at.is_(None)),
         )
         .order_by(PlayerPlaytime.stats_after, PlayerPlaytime.steam_id)
         .limit(1)

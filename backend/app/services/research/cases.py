@@ -14,7 +14,7 @@ from app.models import (
     ResearchSource,
 )
 from app.services.moderation.kill_feed import PAGE_LIMIT
-from app.services.research.playtime import CONTROL_MS, DAY, observed_hours_lower_bound
+from app.services.research.playtime import CONTROL_MS, DAY
 
 VERSION = 1
 COMBAT_WINDOW = 30 * 60_000
@@ -50,6 +50,7 @@ async def add_case(
     label: str,
     hours_source: str | None = None,
     qualifying_ms: int | None = None,
+    selected_at: int | None = None,
 ) -> None:
     if not is_player(sid) or not 0 < cutoff or (entry is not None and entry > cutoff):
         raise ValueError("Некорректная граница исследовательского среза")
@@ -62,7 +63,7 @@ async def add_case(
             cohort=cohort,
             episode=episode,
             cutoff_at=cutoff,
-            selected_at=now_ms(),
+            selected_at=now_ms() if selected_at is None else selected_at,
             hours_source=hours_source,
             qualifying_ms=qualifying_ms,
             entry_at=entry,
@@ -191,7 +192,7 @@ async def sync_cases(db: AsyncSession, project: int, server: int, now: int) -> N
         .where(
             ResearchCase.project_id == project,
             ResearchCase.cohort == "control",
-            ResearchCase.label == "control",
+            ResearchCase.label.in_(("control", "awaiting_playtime")),
             has_ban(ResearchCase.steam_id),
         )
         .values(label="excluded")
@@ -207,37 +208,50 @@ async def sync_cases(db: AsyncSession, project: int, server: int, now: int) -> N
         .correlate(PlayerPlaytime)
         .scalar_subquery()
     )
-    observed_ms = observed_hours_lower_bound(now)
+    recent_annual = (
+        PlayerPlaytime.annual_checked_at.between(now - DAY, now)
+        & (PlayerPlaytime.annual_ms > CONTROL_MS)
+        & (PlayerPlaytime.annual_checked_at >= func.coalesce(ResearchCase.cutoff_at, 0))
+    )
     controls = await db.execute(
-        select(PlayerPlaytime, verified_project, observed_ms)
+        select(PlayerPlaytime, ResearchCase, verified_project, recent_annual)
+        .select_from(PlayerPlaytime)
         .join(
             Player,
             (Player.project_id == PlayerPlaytime.project_id)
             & (Player.steam_id == PlayerPlaytime.steam_id),
         )
+        .outerjoin(
+            ResearchCase,
+            (ResearchCase.project_id == project)
+            & (ResearchCase.server_id == server)
+            & (ResearchCase.steam_id == PlayerPlaytime.steam_id)
+            & (ResearchCase.cohort == "control")
+            & (ResearchCase.version == VERSION),
+        )
         .where(
             PlayerPlaytime.project_id == project,
             Player.last_client_kind == "pirated",
-            (observed_ms > CONTROL_MS)
+            recent_annual
             | ((PlayerPlaytime.project_ms > CONTROL_MS) & (verified_project > CONTROL_MS)),
-            PlayerPlaytime.calculated_at >= now - DAY,
+            ResearchCase.id.is_(None) | (ResearchCase.label == "awaiting_playtime"),
             ~has_ban(PlayerPlaytime.steam_id),
-            ~select(ResearchCase.id)
-            .where(
-                ResearchCase.project_id == project,
-                ResearchCase.server_id == server,
-                ResearchCase.steam_id == PlayerPlaytime.steam_id,
-                ResearchCase.cohort == "control",
-                ResearchCase.version == VERSION,
-            )
-            .exists(),
         )
         .limit(64)
     )
-    for player, project_ms, observed in controls:
+    for player, previous_case, project_ms, use_annual in controls:
+        selected_at = player.annual_checked_at if use_annual else now
+        qualifying_ms = player.annual_ms if use_annual else int(project_ms)
+        if previous_case is not None:
+            previous_case.hours_source = "rustapp"
+            previous_case.qualifying_ms = qualifying_ms
+            previous_case.selected_at = selected_at
+            previous_case.label = "control"
+            continue
         entry = player.first_join_at if player.first_join_server_id == server else None
-        cutoff = min(now, entry + COMBAT_WINDOW) if entry else now
-        from_stats = project_ms is not None and project_ms > CONTROL_MS
+        if entry is not None and entry > selected_at:
+            entry = None
+        cutoff = min(selected_at, entry + COMBAT_WINDOW) if entry else selected_at
         await add_case(
             db,
             project,
@@ -248,6 +262,7 @@ async def sync_cases(db: AsyncSession, project: int, server: int, now: int) -> N
             cutoff=cutoff,
             entry=entry,
             label="control",
-            hours_source="rustapp" if from_stats else "observations",
-            qualifying_ms=int(project_ms) if from_stats else observed,
+            hours_source="rustapp",
+            qualifying_ms=qualifying_ms,
+            selected_at=selected_at,
         )

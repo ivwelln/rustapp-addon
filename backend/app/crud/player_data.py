@@ -4,8 +4,17 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.player_data import PlayerData, PlayerIP, PlayerReport, PlayerSession
+from app.crud.presence import PRESENT, confirmed_presence_at
+from app.models.player_data import (
+    ObservedPlay,
+    PlayerData,
+    PlayerIP,
+    PlayerPresence,
+    PlayerReport,
+    PlayerSession,
+)
 from app.services.moderation.facts import Session
+from app.services.moderation.playtime import YEAR_MS
 
 
 async def save_response(
@@ -78,6 +87,60 @@ async def stored_sessions(db: AsyncSession, project: int, steam_id: str) -> list
         .order_by(PlayerSession.connected_at)
     )
     return [Session.model_validate(payload) for payload in payloads]
+
+
+async def known_sessions(
+    db: AsyncSession,
+    project: int,
+    steam_id: str,
+    presence: PlayerPresence | None,
+    now: int,
+) -> list[Session]:
+    """Recover server and client identity for moderation evidence."""
+    records = [
+        session
+        for session in await stored_sessions(db, project, steam_id)
+        if session.disconnected_at is not None
+    ]
+    observed = await db.scalars(
+        select(ObservedPlay).where(
+            ObservedPlay.project_id == project,
+            ObservedPlay.steam_id == steam_id,
+            ObservedPlay.ended_at > now - YEAR_MS,
+        )
+    )
+    records.extend(
+        Session(
+            project_id=project,
+            steam_id=steam_id,
+            server_id=record.server_id,
+            connected_at=record.started_at,
+            joined_at=record.started_at,
+            disconnected_at=record.ended_at,
+            is_license=None if record.is_pirated is None else not record.is_pirated,
+        )
+        for record in observed
+    )
+    if (
+        presence is not None
+        and presence.status in PRESENT
+        and presence.server_id is not None
+        and presence.server_since is not None
+    ):
+        confirmed = await confirmed_presence_at(db, project)
+        if confirmed is not None and confirmed > presence.server_since:
+            records.append(
+                Session(
+                    project_id=project,
+                    steam_id=steam_id,
+                    server_id=presence.server_id,
+                    connected_at=presence.server_since,
+                    joined_at=presence.server_since,
+                    disconnected_at=min(confirmed, now),
+                    is_license=None if presence.is_pirated is None else not presence.is_pirated,
+                )
+            )
+    return sorted(records, key=lambda item: item.connected_at)
 
 
 async def save_reports(db: AsyncSession, project: int, steam_id: str, reports: list[dict]) -> None:

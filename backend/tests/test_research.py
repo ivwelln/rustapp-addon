@@ -25,8 +25,8 @@ from app.models import (
 )
 from app.services.moderation.eligibility import annual_ms, hours_proof_is_current
 from app.services.research.cases import add_case, source_params, sync_cases
-from app.services.research.playtime import DAY, HOUR, cache_days, missing_range
-from app.services.research.queue import claim_source, hydrate, store_work
+from app.services.research.playtime import DAY, HOUR, cache_days, missing_range, refresh_hours
+from app.services.research.queue import claim_hours, claim_source, hydrate, store_work
 from app.services.research.snapshots import Snapshot, prepare
 from app.workers.import_research import save_archived
 
@@ -237,7 +237,44 @@ async def test_research_and_live_clients_share_cooldown_and_research_budget():
 
 
 @database
-async def test_control_requires_over_twenty_project_hours_and_excludes_unreviewed_ban():
+async def test_trusted_active_pirate_can_qualify_on_a_later_day():
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    project, now = uuid4().int % (2**30) + 1, now_ms()
+    try:
+        async with sessions.begin() as db:
+            db.add(
+                Player(
+                    project_id=project,
+                    steam_id=SID,
+                    last_client_kind="pirated",
+                    is_whitelisted=True,
+                )
+            )
+            db.add(PlayerPlaytime(project_id=project, steam_id=SID, stats_checked_at=now - DAY))
+            await confirm_presence_connection(db, project, now)
+            await save_presence(db, project, {SID: "afk"}, (now - 1000) * 1_000_000)
+            assert await claim_hours(db, project, SERVER, now) is None
+            await save_presence(db, project, {SID: "online"}, now * 1_000_000)
+            job = await claim_hours(db, project, SERVER, now)
+            assert job.source == "stats" and job.params["time_to"] == now // DAY * DAY - 1
+            await store_work(
+                db, project, job, stats(job.params["time_from"], job.params["time_to"], 21), now
+            )
+            await refresh_hours(db, project, now)
+            await sync_cases(db, project, SERVER, now)
+            assert (
+                await db.scalar(select(ResearchCase).where(ResearchCase.project_id == project))
+            ).hours_source == "rustapp"
+            await confirm_presence_connection(db, project, now + DAY)
+            assert await claim_hours(db, project, SERVER, now + DAY) is None
+    finally:
+        await engine.dispose()
+
+
+@database
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_control_requires_over_twenty_project_hours_and_excludes_unreviewed_ban(legacy):
     engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
     sessions = async_sessionmaker(engine)
     project, now = uuid4().int % (2**30) + 1, now_ms()
@@ -247,19 +284,42 @@ async def test_control_requires_over_twenty_project_hours_and_excludes_unreviewe
             cache = PlayerPlaytime(
                 project_id=project,
                 steam_id=SID,
-                observed_ms=20 * HOUR,
+                annual_ms=20 * HOUR,
+                annual_checked_at=now,
                 project_ms=40 * HOUR,
                 calculated_at=now,
             )
             db.add(cache)
             await db.flush()
+            if legacy:
+                await add_case(
+                    db,
+                    project,
+                    SERVER,
+                    SID,
+                    cohort="control",
+                    episode=0,
+                    cutoff=now - DAY,
+                    entry=None,
+                    label="awaiting_playtime",
+                    hours_source="observations",
+                    qualifying_ms=24 * HOUR,
+                )
             await sync_cases(db, project, SERVER, now)
             query = select(ResearchCase).where(ResearchCase.project_id == project)
-            assert await db.scalar(query) is None
-            cache.observed_ms += 1
+            eligible = query.where(ResearchCase.label == "control")
+            assert await db.scalar(eligible) is None
+            cache.annual_ms += 1
+            cache.annual_checked_at = now - 2 * DAY
             await sync_cases(db, project, SERVER, now)
-            control = await db.scalar(query)
-            assert control.label == "control" and control.hours_source == "observations"
+            assert await db.scalar(eligible) is None
+            cache.annual_checked_at = now
+            await sync_cases(db, project, SERVER, now)
+            control = (await db.scalars(query)).one()
+            assert control.label == "control" and control.hours_source == "rustapp"
+            assert control.qualifying_ms == 20 * HOUR + 1
+            if legacy:
+                assert control.cutoff_at == now - DAY and control.selected_at == now
             from app.models import ReferenceBan
 
             ban = ReferenceBan(
@@ -317,7 +377,7 @@ async def test_project_stats_protect_and_select_regardless_of_first_server(first
             player = await db.get(Player, (project, SID))
             cache = await db.get(PlayerPlaytime, (project, SID))
             assert player.is_whitelisted and cache.project_ms == 21.67 * HOUR
-            assert cache.project_days == 1 and cache.observed_ms < HOUR
+            assert cache.project_days == 1 and cache.annual_ms is None
             assert (
                 cache.first_join_at == now - 119_000 and cache.first_join_server_id == first_server
             )

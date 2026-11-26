@@ -21,6 +21,7 @@ from app.clients.rustapp.exceptions import (
 from app.clients.rustapp.moderation import is_player, read, results
 from app.core.config import ModerationSettings
 from app.crud.moderation import archive, now_ms
+from app.crud.player_data import known_sessions
 from app.crud.players import whitelist_for_playtime, whitelisted
 from app.crud.presence import player_is_afk, presence_is_current, save_presence
 from app.models import Decision, PlayerData, PlayerPresence, ReferenceBan
@@ -35,7 +36,7 @@ from app.services.moderation.eligibility import (
 )
 from app.services.moderation.evaluate import PRIORITY, describe
 from app.services.moderation.facts import MINUTE
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS
 
 logger = logging.getLogger(__name__)
 
@@ -307,11 +308,7 @@ async def deliver(
             row.state = "cancelled"
             return
         now = now_ms()
-        if (
-            played_ms(await known_sessions(db, project, sid, current, now), server_id=None, now=now)
-            >= WHITELIST_PLAYTIME_MS
-            or await cached_project_ms(db, project, sid, now) >= WHITELIST_PLAYTIME_MS
-        ):
+        if await cached_project_ms(db, project, sid, now) >= WHITELIST_PLAYTIME_MS:
             await whitelist_for_playtime(db, project, sid)
             row.state = "cancelled"
             return
