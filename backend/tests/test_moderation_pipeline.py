@@ -595,11 +595,11 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     assert (await db.get(PlayerReport, (project, 33))).steam_id == steam_id
                     assert await db.get(PlayerIP, (project, steam_id, ip))
                     assert await db.get(PlayerIP, (project, steam_id, "192.0.2.99")) is None
-                    # A rejoin in the cache window refreshes only the two fast-changing sources.
+                    # A new entry rechecks annual hours while short-lived detail data stays cached.
                     job.requested_at = now_ms() + 100
                     requests.clear()
                     await collect(db, RustAppClient(http), job, ModerationSettings())
-                    assert requests == ["kill-feed"]
+                    assert requests == ["stats", "kill-feed"]
                 else:
                     assert player.is_whitelisted and job.due_at is None
                     expected = (
@@ -610,7 +610,7 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     assert player.whitelist_reason == expected
                     expected_requests = {
                         "snapshot_license": [],
-                        "profile_license": ["details"],
+                        "profile_license": ["stats", "details"],
                         "playtime": [],
                         "archived_playtime": [],
                     }

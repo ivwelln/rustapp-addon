@@ -181,7 +181,11 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                         if player.server_id is not None and player.status in ("online", "afk")
                     }
                     await self._update_presence(
-                        statuses, presence_at, seed=True, server_info=servers
+                        statuses,
+                        presence_at,
+                        seed=True,
+                        initial=not refresh,
+                        server_info=servers,
                     )
                     self._snapshot_loaded = True
                 return
@@ -271,6 +275,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
         joined: tuple[str, ...] = (),
         discovered: tuple[str, ...] = (),
         seed: bool = False,
+        initial: bool = False,
         server_info: Mapping[str, tuple[int, bool | None]] | None = None,
     ) -> None:
         while True:
@@ -298,8 +303,8 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 async with self._db_sessions.begin() as db:
                     if seed or "offline" in statuses.values():
                         await remove_offline_jobs(db, self._project_id, observed_at)
-                    await enqueue(db, self._project_id, checks - restart, seed=seed)
-                    await enqueue(db, self._project_id, restart, seed=False, resume=True)
+                    await enqueue(db, self._project_id, checks - restart, seed=seed and not initial)
+                    await enqueue(db, self._project_id, restart, seed=False)
             except (SQLAlchemyError, OSError) as exc:
                 logger.warning("Не удалось обновить очередь игроков (%s)", type(exc).__name__)
                 await asyncio.sleep(SNAPSHOT_DB_RETRY_SECONDS)

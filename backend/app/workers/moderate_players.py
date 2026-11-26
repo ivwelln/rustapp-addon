@@ -138,7 +138,13 @@ async def run() -> None:
                                 CollectionJob.due_at <= now_ms(),
                                 player_is_online(CollectionJob.project_id, CollectionJob.steam_id),
                             )
-                            .order_by(CollectionJob.due_at)
+                            .order_by(
+                                (
+                                    CollectionJob.collected_at.is_(None)
+                                    | (CollectionJob.requested_at > CollectionJob.collected_at)
+                                ).desc(),
+                                CollectionJob.due_at,
+                            )
                             .limit(1)
                             .with_for_update(skip_locked=True)
                         )

@@ -13,10 +13,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import RustAppTransportError
 from app.core.config import ModerationSettings, Settings
-from app.crud.moderation import enqueue, now_ms
-from app.crud.presence import is_afk, player_is_afk, player_is_online
-from app.models import CollectionJob, ObservedPlay, PlayerPresence
+from app.crud.moderation import archive, enqueue, now_ms
+from app.crud.presence import confirm_presence_connection, is_afk, player_is_afk, player_is_online
+from app.models import CollectionJob, ObservedPlay, Player, PlayerPresence
+from app.schemas.rustapp.players import RustAppPlayer
 from app.services.moderation.collect import collect
+from app.services.moderation.playtime import YEAR_MS
+from app.services.research.playtime import DAY
 from app.services.rustapp.player_sessions import PlayerSessionTracker
 from app.workers import listen_player_status
 from app.workers.listen_player_status import PlayerStatusEvents
@@ -45,6 +48,92 @@ async def test_initial_snapshot_retries_without_waiting_for_new_player(monkeypat
         await asyncio.wait_for(listener._snapshot_task, timeout=1)
         assert fetch.await_count == 2
         assert listener._snapshot_loaded is True
+
+
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+@pytest.mark.parametrize("intake", ["startup", "websocket"])
+async def test_first_check_refreshes_annual_hours_before_combat(intake, monkeypatch):
+    project = uuid4().int % (2**30) + 1
+    steam_id = "76561198000000102"
+    now = now_ms()
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    settings = Settings(_secrets_dir=None, rustapp_access_token="test", rustapp_project_id=project)
+    requests = []
+    profile = {
+        "project_id": project,
+        "steam_id": steam_id,
+        "server_id": 164,
+        "status": "online",
+        "last_no_license": True,
+        "created_at": now - YEAR_MS,
+    }
+
+    def reply(request):
+        requests.append(request.url.path)
+        assert request.url.path == f"/players/{steam_id}/stats"
+        start = int(request.url.params["time_from"])
+        end = int(request.url.params["time_to"])
+        assert end - start + 1 == YEAR_MS
+        buckets = {
+            str(day): {"date": day, "hours_played": 0}
+            for day in range(start // DAY * DAY, end + 1, DAY)
+        }
+        buckets[str(end // DAY * DAY - 60 * DAY)]["hours_played"] = 3
+        return httpx2.Response(
+            200,
+            json={"kills": {"steam_id": steam_id}, "playTime": {"total": 3, "stats": buckets}},
+        )
+
+    try:
+        async with sessions.begin() as db:
+            db.add(
+                CollectionJob(
+                    project_id=project,
+                    steam_id=steam_id,
+                    requested_at=now - 2_000,
+                    collected_at=now - 1_000,
+                    due_at=now + 150_000,
+                )
+            )
+            # A current short-window response must not suppress the annual intake check.
+            await archive(db, project, steam_id, "stats", {"playTime": {"total": 0}})
+            await archive(db, project, steam_id, "details", {"player": profile})
+        async with (
+            asyncio.TaskGroup() as tasks,
+            create_rustapp_http_client(settings, transport=httpx2.MockTransport(reply)) as http,
+        ):
+            client = RustAppClient(http)
+            listener = PlayerStatusEvents(
+                asyncio.Event(),
+                court_client=client,
+                db_sessions=sessions,
+                project_id=project,
+                tasks=tasks,
+            )
+            if intake == "startup":
+                snapshot = AsyncMock(return_value=[RustAppPlayer.model_validate(profile)])
+                monkeypatch.setattr(listener, "_fetch_snapshot", snapshot)
+                await listener.on_subscribed(SimpleNamespace(recovered=False, channel="test"))
+                await asyncio.wait_for(listener._snapshot_task, timeout=2)
+            else:
+                publication = SimpleNamespace(
+                    pub=SimpleNamespace(data={"players": {steam_id: "online"}})
+                )
+                await listener.on_publication(publication)
+                await listener.on_publication(publication)
+            async with sessions.begin() as db:
+                await confirm_presence_connection(db, project, now_ms())
+                job = await db.get(CollectionJob, (project, steam_id))
+                assert job.requested_at > job.collected_at and job.due_at <= now_ms()
+                await collect(db, client, job, ModerationSettings())
+                player = await db.get(Player, (project, steam_id))
+                assert player.is_whitelisted and player.whitelist_reason == "playtime"
+                assert job.due_at is None
+                await collect(db, client, job, ModerationSettings())
+        assert requests == [f"/players/{steam_id}/stats"]
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
@@ -104,7 +193,7 @@ async def test_afk_pauses_requests_and_online_wakes_existing_job():
                 assert not await is_afk(db, project, steam_id)
                 job = await db.get(CollectionJob, (project, steam_id))
                 assert job.due_at <= now_ms()
-                assert job.requested_at == original_request
+                assert job.requested_at > original_request
                 assert await db.get(CollectionJob, (project, startup_afk)) is not None
 
             await listener._update_presence(
