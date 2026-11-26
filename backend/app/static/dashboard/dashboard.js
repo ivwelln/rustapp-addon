@@ -274,8 +274,10 @@ function renderActivity() {
     lastTableKey = currentKey;
   }
   const empty = get("empty");
-  empty.hidden = records.length > 0;
-  empty.textContent = !snapshot ? "Загружаем данные…"
+  const waiting = !snapshot && get("connection").dataset.state !== "error";
+  get("roster-loading").hidden = !waiting;
+  empty.hidden = waiting || records.length > 0;
+  empty.textContent = !snapshot ? "Данные пока недоступны"
     : query ? "Записей по этому запросу нет"
       : players ? "Нет игроков с выбранным статусом" : "Решений модерации пока нет";
   get("roster-footer").hidden = !players || !snapshot;
@@ -344,6 +346,7 @@ function setConnection(state, label, message = "") {
   get("connection-label").textContent = label;
   get("error").hidden = !message;
   get("error").textContent = message;
+  if (!snapshot) renderActivity();
 }
 
 async function refresh() {
