@@ -61,17 +61,19 @@ def outcome(matches: dict) -> tuple[str, str]:
     raise ValueError("Нет срабатываний")
 
 
-def describe(code: str, match: dict) -> str:
+def describe(code: str, match: dict, *, reference_ban_id: int | None = None) -> str:
     data = match["evidence"]
     config = match["settings"]
     if code == "P02":
-        prior = data["bans"][0]
+        prior = next(
+            (ban for ban in data["bans"] if ban["id"] == reference_ban_id), data["bans"][0]
+        )
         gap = abs(data["signed_at"] - prior["signed_at"]) / 1000
         return f"Регистрация Steam в пределах {gap:g} с от аккаунта недавнего бана №{prior['id']}"
     if code == "P04":
         return (
             f"Закрытый профиль без даты Steam. Подключение в течение {config['minutes']} мин "
-            f"после бана №{data['prior_bans'][-1]}"
+            f"после бана №{reference_ban_id or data['prior_bans'][-1]}"
         )
     if code == "P07":
         return (

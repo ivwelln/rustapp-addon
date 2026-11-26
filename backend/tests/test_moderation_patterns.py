@@ -3,8 +3,10 @@ from dataclasses import replace
 import pytest
 
 from app.clients.rustapp.moderation import Profile, parse_kill
+from app.models import CollectionJob
 from app.services.moderation.evaluate import evaluate, outcome
 from app.services.moderation.facts import MINUTE, Ban, Facts, Kill, Patterns, Session
+from app.services.moderation.kill_feed import PAGE_LIMIT, update_coverage
 
 SID = "76561198000000000"
 START = 1000 * MINUTE
@@ -19,7 +21,9 @@ def example() -> Facts:
         connected_at=START,
         joined_at=START + 100,
     )
-    return Facts(SID, session, START, True, 12345, True, START + MINUTE, (), ())
+    return Facts(
+        SID, session, START, True, 12345, True, START + MINUTE, (), (), kill_feed_covered_from=START
+    )
 
 
 def hits(count=5):
@@ -82,6 +86,26 @@ def test_repeated_victim_ratio_and_end_of_first_ten_minutes():
         Patterns(),
         entry=False,
     )
+
+
+def test_p07_rejects_truncated_window_and_extends_overlapping_pages():
+    job = CollectionJob()
+    latest_minute = START + MINUTE
+    rows = [{"created_at": latest_minute - index} for index in range(PAGE_LIMIT)]
+    update_coverage(job, {}, rows, start=START, end=latest_minute)
+    assert job.kill_feed_covered_from == latest_minute - PAGE_LIMIT + 2
+    victim = "same"
+    shot_series = tuple(kill.model_copy(update={"victim": victim}) for kill in hits())
+    facts = replace(example(), kills=shot_series, kill_feed_covered_from=job.kill_feed_covered_from)
+    assert "P07" not in evaluate(facts, Patterns(), entry=False)
+
+    update_coverage(job, {}, [], start=START, end=latest_minute + 1)
+    assert "P07" in evaluate(
+        replace(facts, kill_feed_covered_from=job.kill_feed_covered_from), Patterns(), entry=False
+    )
+    rows = [{"created_at": row["created_at"] + 2 * MINUTE} for row in rows]
+    update_coverage(job, {}, rows, start=START, end=latest_minute + 2 * MINUTE)
+    assert job.kill_feed_covered_from > latest_minute
 
 
 def test_unknown_visibility_and_partial_damage_history():

@@ -12,6 +12,8 @@ class CollectionJob(Base):
     requested_at: Mapped[int] = mapped_column(BigInteger)
     collected_at: Mapped[int | None] = mapped_column(BigInteger)
     due_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    kill_feed_covered_from: Mapped[int | None] = mapped_column(BigInteger)
+    kill_feed_covered_through: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class Observation(Base):
@@ -33,7 +35,11 @@ class CombatKill(Base):
     steam_id: Mapped[str] = mapped_column(Text)
     at: Mapped[int] = mapped_column(BigInteger)
     facts: Mapped[dict] = mapped_column(JSONB)
-    __table_args__ = (Index("ix_kill_window", "project_id", "steam_id", "server_id", "at"),)
+    payload: Mapped[dict | None] = mapped_column(JSONB)
+    __table_args__ = (
+        Index("ix_kill_window", "project_id", "steam_id", "server_id", "at"),
+        Index("ix_kill_dashboard", "project_id", "steam_id", "at"),
+    )
 
 
 class ReferenceBan(Base):
@@ -66,6 +72,11 @@ class Decision(Base):
     matches: Mapped[dict] = mapped_column(JSONB)
     ban_ip: Mapped[str | None] = mapped_column(Text)
     external_id: Mapped[int | None] = mapped_column(BigInteger)
+    joined_at: Mapped[int | None] = mapped_column(BigInteger)
+    reference_ban_id: Mapped[int | None] = mapped_column(BigInteger)
+    verdict: Mapped[str | None] = mapped_column(Text)
+    verdict_note: Mapped[str | None] = mapped_column(Text)
+    verdict_at: Mapped[int | None] = mapped_column(BigInteger)
     __table_args__ = (
         Index(
             "uq_decision_session",

@@ -7,16 +7,20 @@ class PlayerSessionTracker:
     def __init__(self) -> None:
         self._statuses: dict[str, PlayerStatus] = {}
 
-    def apply(self, statuses: Mapping[str, PlayerStatus]) -> list[str]:
+    def apply(self, statuses: Mapping[str, PlayerStatus]) -> tuple[list[str], list[str]]:
         joined: list[str] = []
+        discovered: list[str] = []
 
-        for steamd_id, status in statuses.items():
-            previous = self._statuses.get(steamd_id)
-            self._statuses[steamd_id] = status
-            if previous in ("joining", "offline") and status in ("afk", "online"):
-                joined.append(steamd_id)
+        for steam_id, status in statuses.items():
+            previous = self._statuses.get(steam_id)
+            self._statuses[steam_id] = status
+            if status == "online":
+                if previous in ("joining", "offline"):
+                    joined.append(steam_id)
+                elif previous is None:
+                    discovered.append(steam_id)
 
-        return joined
+        return joined, discovered
 
     def reset(self) -> None:
         self._statuses.clear()

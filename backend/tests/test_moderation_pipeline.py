@@ -7,21 +7,36 @@ from uuid import uuid4
 
 import httpx2
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.ban_guard.api import app as ban_guard_api
+from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
-from app.clients.rustapp.exceptions import RustAppTimeoutError
+from app.clients.rustapp.exceptions import RustAppRequestNotSent, RustAppTimeoutError
 from app.core.config import ModerationSettings, Settings
-from app.crud.moderation import enqueue, now_ms
-from app.models import CollectionJob, CombatKill, Decision, Observation
+from app.crud.moderation import archive, enqueue, now_ms
+from app.crud.presence import confirm_presence_connection, save_presence
+from app.models import CollectionJob, CombatKill, Decision, Observation, PlayerSession, ReferenceBan
 from app.services.moderation.bans import covers_requested_ban, deliver, reconcile, sync_bans
 from app.services.moderation.collect import collect
 
 
 @pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
 @pytest.mark.parametrize(
-    "outcome", ["confirmed", "wrong_ip", "missing_ip", "already_banned", "observe"]
+    "outcome",
+    [
+        "confirmed",
+        "confirmed_after_exit",
+        "wrong_ip",
+        "missing_ip",
+        "already_banned",
+        "observe",
+        "new_session",
+        "other_server",
+        "became_licensed",
+        "local_counter_failure",
+    ],
 )
 async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
     caplog.set_level(logging.INFO, logger="app")
@@ -30,15 +45,16 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
     sid = "76561198000000000"
     now = now_ms()
     start = now - 100_000
-    session = dict(
+    profile = dict(
         project_id=project,
         steam_id=sid,
         server_id=163,
-        connected_at=start,
-        joined_at=start + 100,
-        is_license=False,
+        status="online",
+        last_no_license=True,
         ip=session_ip,
+        created_at=start,
     )
+    requests = []
     feed = [
         dict(
             id=event_number,
@@ -70,6 +86,8 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
 
     def handle(req):
         path = req.url.path
+        assert not path.endswith("/session-history")
+        requests.append(path)
         if req.method == "PUT":
             body = json.loads(req.content)["bans"][0]
             submitted.append(body)
@@ -85,16 +103,16 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
             )
             raise httpx2.ReadTimeout("Response lost", request=req)
         if path.endswith("/details"):
-            data = {"player": {"project_id": project, "steam_id": sid, "created_at": start}}
+            data = {"player": profile}
         elif path.endswith("/checks"):
             data = {"total": 5, "results": [{"private": "omit"}]}
         elif path.endswith("/stats"):
             data = {"kills": {}}
         else:
             records = {
-                "session-history": [session],
                 "kill-feed": feed,
                 "reports": [],
+                "ip-history": [],
                 "browse": bans,
             }
             data = {"page": 0, "results": records[path.split("/")[-1]]}
@@ -104,12 +122,26 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
     sessions = async_sessionmaker(engine)
     config = Settings(rustapp_access_token="test", rustapp_project_id=project)
     settings = ModerationSettings(enforce=outcome != "observe")
+    ban_guard_api.state.sessions = sessions
     try:
-        async with create_rustapp_http_client(
-            config, transport=httpx2.MockTransport(handle)
-        ) as http:
+        async with (
+            create_rustapp_http_client(config, transport=httpx2.MockTransport(handle)) as http,
+            httpx2.AsyncClient(
+                base_url="http://ban-guard", transport=httpx2.ASGITransport(app=ban_guard_api)
+            ) as guard_http,
+        ):
+            guard = BanGuard(guard_http, project)
             client = RustAppClient(http)
             async with sessions.begin() as db:
+                await confirm_presence_connection(db, project, now)
+                await save_presence(db, project, {sid: "joining"}, (start - 25) * 1_000_000)
+                await save_presence(
+                    db,
+                    project,
+                    {sid: "online"},
+                    start * 1_000_000,
+                    server_info={sid: (163, True)},
+                )
                 await enqueue(db, project, [sid, sid], seed=False)
             for _ in range(2):
                 async with sessions.begin() as db:
@@ -134,13 +166,35 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     await db.scalars(select(Observation).where(Observation.project_id == project))
                 ).all()
                 assert len(observations) == 6
+                assert requests.count(f"/players/{sid}/details") == 1
                 assert next(
                     observation.payload
                     for observation in observations
                     if observation.source == "checks"
                 ) == {"total": 5}
+            if outcome in {"new_session", "other_server", "became_licensed"}:
+                if outcome == "new_session":
+                    async with sessions.begin() as db:
+                        await save_presence(db, project, {sid: "offline"}, (now - 1) * 1_000_000)
+                        await save_presence(
+                            db,
+                            project,
+                            {sid: "online"},
+                            now * 1_000_000,
+                            server_info={sid: (163, True)},
+                        )
+                if outcome == "other_server":
+                    profile["server_id"] = 164
+                if outcome == "became_licensed":
+                    profile["last_no_license"] = False
+                await deliver(sessions, client, project, settings, guard)
+                async with sessions() as db:
+                    row = await db.scalar(select(Decision).where(Decision.project_id == project))
+                    assert row.state == "cancelled"
+                assert not submitted
+                return
             if outcome in {"missing_ip", "already_banned", "observe"}:
-                await deliver(sessions, client, project, settings)
+                await deliver(sessions, client, project, settings, guard)
                 expected = {
                     "missing_ip": "failed",
                     "already_banned": "superseded",
@@ -153,28 +207,101 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                 assert "паттерн=P05" in caplog.text and "жертв" in caplog.text
                 assert "Блокировка подтверждена" not in caplog.text
                 return
+            if outcome == "local_counter_failure":
+
+                async def fail_before_send(request):
+                    if request.method == "PUT":
+                        raise RustAppRequestNotSent("test counter failure")
+
+                http.event_hooks["request"].append(fail_before_send)
+                with pytest.raises(RustAppRequestNotSent):
+                    await deliver(sessions, client, project, settings, guard)
+                async with sessions() as db:
+                    row = await db.scalar(select(Decision).where(Decision.project_id == project))
+                    assert row.state == "pending"
+                assert submitted == []
+                return
             with pytest.raises(RustAppTimeoutError):
-                await deliver(sessions, client, project, settings)
+                await deliver(sessions, client, project, settings, guard)
             assert "Отправка бессрочного бана" in caplog.text
             assert "Блокировка подтверждена" not in caplog.text
-            await deliver(sessions, client, project, settings)
+            await deliver(sessions, client, project, settings, guard)
             async with sessions.begin() as db:
-                await reconcile(db, client, project, 163)
-                await sync_bans(db, client, project)
+                if outcome == "confirmed_after_exit":
+                    await save_presence(db, project, {sid: "offline"}, (now + 1) * 1_000_000)
+                    requests.clear()
+                    await sync_bans(db, client, project)
+                    await reconcile(db, client, project, 163)
+                    assert requests == ["/ban/browse"]
+                else:
+                    await reconcile(db, client, project, 163)
+                    await sync_bans(db, client, project)
                 row = await db.scalar(select(Decision).where(Decision.project_id == project))
                 assert row.state == ("failed" if outcome == "wrong_ip" else "confirmed")
                 assert row.external_id == 789 and row.ban_ip == session_ip
-                from app.models import ReferenceBan
-
                 assert (await db.get(ReferenceBan, (project, 789))).eligible == (
-                    outcome == "confirmed"
+                    outcome in {"confirmed", "confirmed_after_exit"}
                 )
             assert len(submitted) == 1
             assert submitted[0]["server_ids"] == [] and "expired_at" not in submitted[0]
             assert submitted[0]["ban_ip_active"] is True and submitted[0]["ban_ip"] == session_ip
-            assert ("Блокировка подтверждена RustApp" in caplog.text) == (outcome == "confirmed")
+            assert ("Блокировка подтверждена RustApp" in caplog.text) == (
+                outcome in {"confirmed", "confirmed_after_exit"}
+            )
             assert "паттерн=P05" in caplog.text and "жертв" in caplog.text and sid in caplog.text
             assert session_ip not in caplog.text
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+async def test_ban_sync_reads_existing_page_in_batch_and_backfills_cached_date():
+    project = uuid4().int % (2**30) + 1
+    steam_id = "76561198000000099"
+    now = now_ms()
+    rows = [
+        {
+            "id": index + 1,
+            "created_at": now - index,
+            "project_id": project,
+            "steam_id": steam_id,
+            "reason": "чит",
+            "computed_is_active": True,
+            "server_ids": [],
+        }
+        for index in range(50)
+    ]
+
+    def handle(request):
+        assert request.url.path == "/ban/browse" and request.url.params["page"] == "0"
+        return httpx2.Response(200, json={"page": 0, "results": rows})
+
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    settings = Settings(_secrets_dir=None, rustapp_access_token="test", rustapp_project_id=project)
+    selects = []
+
+    def count_reads(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().startswith("SELECT"):
+            selects.append(statement)
+
+    try:
+        async with create_rustapp_http_client(
+            settings, transport=httpx2.MockTransport(handle)
+        ) as http:
+            client = RustAppClient(http)
+            async with sessions.begin() as db:
+                await sync_bans(db, client, project)
+                await archive(
+                    db, project, steam_id, "details", {"player": {"steam_data": {"signed_at": now}}}
+                )
+            event.listen(engine.sync_engine, "before_cursor_execute", count_reads)
+            async with sessions.begin() as db:
+                await sync_bans(db, client, project)
+            assert len(selects) == 2
+            async with sessions() as db:
+                record = await db.get(ReferenceBan, (project, 50))
+                assert record.signed_at == now
     finally:
         await engine.dispose()
 
@@ -240,3 +367,195 @@ def test_partial_ban_does_not_cover_requested_ban(changed_field):
     }
     assert covers_requested_ban(permanent, target_ip)
     assert not covers_requested_ban({**permanent, **changed_field}, target_ip)
+
+
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+@pytest.mark.parametrize(
+    "trust_reason",
+    [
+        "snapshot_license",
+        "profile_license",
+        "playtime",
+        "archived_playtime",
+        "under_limit",
+        "stale_listener",
+    ],
+)
+async def test_whitelist_stops_player_requests(trust_reason):
+    from datetime import UTC, datetime
+
+    from app.models import Player, PlayerData, PlayerIP, PlayerReport
+    from app.schemas.rustapp.players import RustAppPlayer
+    from app.services.rustapp.player_snapshots import save_player_snapshot
+
+    project = uuid4().int % (2**30) + 1
+    steam_id = "76561198000000099"
+    now = now_ms()
+    duration = 3 * 60 * 60 * 1000
+    joined_at = now - duration - 1000
+    ip = "192.0.2.5"
+    requests = []
+
+    def handle(request):
+        assert not request.url.path.endswith("/session-history")
+        requests.append(request.url.path.rsplit("/", 1)[-1])
+        if request.url.path == "/ban/browse":
+            assert "steam_id" not in request.url.params
+            return httpx2.Response(
+                200,
+                json={
+                    "page": 0,
+                    "results": [
+                        {
+                            "id": 25,
+                            "project_id": project,
+                            "steam_id": steam_id,
+                            "created_at": now,
+                            "reason": "чит",
+                            "computed_is_active": True,
+                            "server_ids": [],
+                        }
+                    ],
+                },
+            )
+        data = {
+            "details": {
+                "player": {
+                    "project_id": project,
+                    "steam_id": steam_id,
+                    "created_at": joined_at,
+                    "status": "online",
+                    "server_id": 163,
+                    "last_no_license": False if trust_reason == "profile_license" else True,
+                }
+            },
+            "stats": {"kills": {}},
+            "checks": {"total": 2},
+            "reports": {
+                "page": 0,
+                "results": [
+                    {"id": 33, "target_steam_id": steam_id, "created_at": now, "reason": "чит"}
+                ],
+            },
+            "ip-history": {
+                "page": 0,
+                "results": [
+                    {"ip": ip, "created_at": joined_at, "project_id": project},
+                    {"ip": "192.0.2.99", "created_at": joined_at, "project_id": -1},
+                ],
+            },
+            "kill-feed": {"page": 0, "results": []},
+        }
+        return httpx2.Response(200, json=data[requests[-1]])
+
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    config = Settings(rustapp_access_token="test", rustapp_project_id=project)
+    try:
+        # Simulate a job already queued before a newer snapshot marks the player as trusted.
+        async with sessions.begin() as db:
+            await enqueue(db, project, [steam_id], seed=False)
+            started_at = joined_at if trust_reason in {"playtime", "stale_listener"} else now - 500
+            confirmed_at = now if trust_reason != "stale_listener" else started_at + 1000
+            await confirm_presence_connection(db, project, confirmed_at)
+            await save_presence(
+                db,
+                project,
+                {steam_id: "online"},
+                started_at * 1_000_000,
+                server_info={steam_id: (163, True)},
+            )
+            if trust_reason in {"archived_playtime", "under_limit"}:
+                prior_start = now - 2 * duration
+                prior_end = prior_start + (
+                    duration + 10
+                    if trust_reason == "archived_playtime"
+                    else duration - 30 * 60 * 1000
+                )
+                db.add(
+                    PlayerSession(
+                        project_id=project,
+                        steam_id=steam_id,
+                        server_id=163,
+                        connected_at=prior_start,
+                        payload={
+                            "project_id": project,
+                            "steam_id": steam_id,
+                            "server_id": 163,
+                            "connected_at": prior_start,
+                            "joined_at": prior_start,
+                            "disconnected_at": prior_end,
+                        },
+                    )
+                )
+        if trust_reason == "snapshot_license":
+            await save_player_snapshot(
+                sessions,
+                project_id=project,
+                observed_at=datetime.now(UTC),
+                players=[
+                    RustAppPlayer(
+                        steam_id=steam_id,
+                        project_id=project,
+                        last_no_license=False,
+                        status="online",
+                    )
+                ],
+            )
+        async with create_rustapp_http_client(
+            config, transport=httpx2.MockTransport(handle)
+        ) as http:
+            async with sessions.begin() as db:
+                job = await db.get(CollectionJob, (project, steam_id), with_for_update=True)
+                await collect(db, RustAppClient(http), job, ModerationSettings())
+            async with sessions.begin() as db:
+                job = await db.get(CollectionJob, (project, steam_id))
+                player = await db.get(Player, (project, steam_id))
+                data = await db.get(PlayerData, (project, steam_id))
+                if trust_reason == "stale_listener":
+                    assert not player.is_whitelisted
+                    assert data is None and requests == []
+                    return
+                if trust_reason == "under_limit":
+                    assert not player.is_whitelisted
+                    assert set(data.responses) == {
+                        "details",
+                        "stats",
+                        "checks",
+                        "reports",
+                        "ip-history",
+                        "kill-feed",
+                    }
+                    assert data.responses["checks"]["payload"] == {"total": 2}
+                    assert (await db.get(PlayerReport, (project, 33))).steam_id == steam_id
+                    assert await db.get(PlayerIP, (project, steam_id, ip))
+                    assert await db.get(PlayerIP, (project, steam_id, "192.0.2.99")) is None
+                    # A rejoin in the cache window refreshes only the two fast-changing sources.
+                    job.requested_at = now_ms() + 100
+                    requests.clear()
+                    await collect(db, RustAppClient(http), job, ModerationSettings())
+                    assert requests == ["kill-feed"]
+                else:
+                    assert player.is_whitelisted and job.due_at is None
+                    expected = (
+                        "playtime"
+                        if trust_reason in {"playtime", "archived_playtime"}
+                        else "license"
+                    )
+                    assert player.whitelist_reason == expected
+                    expected_requests = {
+                        "snapshot_license": [],
+                        "profile_license": ["details"],
+                        "playtime": [],
+                        "archived_playtime": [],
+                    }
+                    assert requests == expected_requests[trust_reason]
+                    await enqueue(db, project, [steam_id], seed=False)
+                    assert job.due_at is None
+            if trust_reason != "under_limit":
+                requests.clear()
+                async with sessions.begin() as db:
+                    await sync_bans(db, RustAppClient(http), project)
+                assert requests == ["browse"]
+    finally:
+        await engine.dispose()

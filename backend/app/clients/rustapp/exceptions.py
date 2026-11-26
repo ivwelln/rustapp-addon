@@ -10,6 +10,10 @@ class RustAppTimeoutError(RustAppTransportError):
     """Истекло время ожидания при обращении к RustApp."""
 
 
+class RustAppRequestNotSent(RustAppTransportError):
+    """Локальная ошибка до передачи запроса в транспорт."""
+
+
 class RustAppHTTPError(RustAppError):
     """RustApp вернул ответ с неуспешным HTTP-статусом."""
 
@@ -21,3 +25,7 @@ class RustAppHTTPError(RustAppError):
 
 class RustAppResponseError(RustAppError):
     """RustApp вернул ответ неожиданного формата."""
+
+
+class PlayerNotOnline(RustAppError):
+    """Персональный запрос отменён, пока не подтверждён статус online."""

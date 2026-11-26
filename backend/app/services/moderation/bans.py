@@ -1,25 +1,36 @@
 import logging
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from ipaddress import ip_address
+from time import time_ns
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import (
+    PlayerNotOnline,
     RustAppHTTPError,
+    RustAppRequestNotSent,
     RustAppResponseError,
     RustAppTransportError,
 )
 from app.clients.rustapp.moderation import is_player, read, results
 from app.core.config import ModerationSettings
 from app.crud.moderation import archive, now_ms
-from app.models import Decision, Player, ReferenceBan
-from app.services.moderation.collect import fetch_profile, fetch_sessions
+from app.crud.players import whitelist_for_playtime, whitelisted
+from app.crud.presence import player_is_afk, presence_is_current, save_presence
+from app.models import Decision, PlayerData, PlayerPresence, ReferenceBan
+from app.services.moderation.collect import (
+    cache_profile,
+    fetch_profile,
+)
 from app.services.moderation.evaluate import PRIORITY, describe
 from app.services.moderation.facts import MINUTE
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
 
 logger = logging.getLogger(__name__)
 
@@ -77,21 +88,64 @@ async def sync_bans(
         for ban in rows:
             if ban.get("project_id") != project or not is_player(ban.get("steam_id")):
                 raise RustAppResponseError("Некорректная запись бана проекта")
-            existing = await db.get(ReferenceBan, (project, ban["id"]))
+        signed_date = PlayerData.responses["details"]["payload"]["player"]["steam_data"][
+            "signed_at"
+        ]
+        stored = (
+            {
+                record.ban_id: (record, signed_at)
+                for record, signed_at in (
+                    await db.execute(
+                        select(ReferenceBan, signed_date)
+                        .outerjoin(
+                            PlayerData,
+                            (PlayerData.project_id == ReferenceBan.project_id)
+                            & (PlayerData.steam_id == ReferenceBan.steam_id),
+                        )
+                        .where(
+                            ReferenceBan.project_id == project,
+                            ReferenceBan.ban_id.in_([ban["id"] for ban in rows]),
+                        )
+                    )
+                )
+            }
+            if rows
+            else {}
+        )
+        for ban in rows:
+            existing, cached_date = stored.get(ban["id"], (None, None))
+            if type(cached_date) is not int or cached_date <= 0:
+                cached_date = None
             if existing and existing.payload == ban:
+                if existing.eligible and existing.signed_at is None:
+                    existing.signed_at = cached_date
                 continue
             eligible = await usable_ban(db, project, ban)
             signed_at = server = None
             pirate = False
             if eligible:
                 sid = ban["steam_id"]
-                sessions = []
+                presence = await db.get(PlayerPresence, (project, sid))
+                sessions = await known_sessions(db, project, sid, presence, until)
+                if existing is None:
+                    cached_date = await db.scalar(
+                        select(signed_date).where(
+                            PlayerData.project_id == project, PlayerData.steam_id == sid
+                        )
+                    )
+                signed_at = cached_date if type(cached_date) is int and cached_date > 0 else None
                 try:
-                    profile, details = await fetch_profile(client, project, sid)
-                    signed_at = profile.signed_at
-                    await archive(db, project, sid, "details", details)
-                    sessions, history = await fetch_sessions(client, project, sid)
-                    await archive(db, project, sid, "session-history", history)
+                    if (
+                        signed_at is None
+                        and presence is not None
+                        and presence.status == "online"
+                        and not await whitelisted(db, project, sid)
+                    ):
+                        profile, details = await fetch_profile(client, project, sid)
+                        signed_at = profile.signed_at
+                        await cache_profile(db, project, sid, details)
+                except PlayerNotOnline:
+                    pass
                 except RustAppHTTPError as exc:
                     if exc.status_code not in (404, 422):
                         raise
@@ -135,14 +189,18 @@ async def sync_bans(
         page += 1
 
 
-async def player_bans(client: RustAppClient, project: int, sid: str) -> AsyncIterator[dict]:
+async def player_bans(
+    db: AsyncSession, client: RustAppClient, project: int, sid: str
+) -> AsyncIterator[dict]:
     params = dict(project_id=project, steam_id=sid, sort_by="created", limit=50)
     page = 0
     while True:
-        rows = results(await read(client, "/ban/browse", page=page, **params), page=page)
+        data = await read(client, "/ban/browse", page=page, **params)
+        rows = results(data, page=page)
+        if any(ban.get("project_id") != project or ban.get("steam_id") != sid for ban in rows):
+            raise RustAppResponseError("Несовпадение владельца бана")
+        await archive(db, project, sid, f"ban-history:{page}", data)
         for ban in rows:
-            if ban.get("project_id") != project or ban.get("steam_id") != sid:
-                raise RustAppResponseError("Несовпадение владельца бана")
             yield ban
         if len(rows) < 50:
             return
@@ -151,9 +209,12 @@ async def player_bans(client: RustAppClient, project: int, sid: str) -> AsyncIte
 
 async def valid_reference(
     db: AsyncSession, client: RustAppClient, project: int, pattern: str, evidence: dict
-) -> bool:
+) -> int | None:
     ids = [ban["id"] for ban in evidence["bans"]] if pattern == "P02" else evidence["prior_bans"]
     for ban_id in ids:
+        known = await db.get(ReferenceBan, (project, ban_id))
+        if known is not None and await whitelisted(db, project, known.steam_id):
+            continue
         rows = results(
             await read(
                 client,
@@ -168,8 +229,8 @@ async def valid_reference(
         for ban in rows:
             if ban.get("id") == ban_id and ban.get("project_id") == project:
                 if await usable_ban(db, project, ban):
-                    return True
-    return False
+                    return ban_id
+    return None
 
 
 def covers_requested_ban(ban: dict, expected_ip: str) -> bool:
@@ -192,11 +253,14 @@ async def deliver(
     client: RustAppClient,
     project: int,
     settings: ModerationSettings,
+    guard: BanGuard,
 ) -> None:
     if not settings.enforce:
         return
-    # Claim durably before sending. An ambiguous PUT is reconciled by marker, never repeated.
+    # The guard commits the claim before sending, so ambiguous PUTs keep their slot.
     async with sessions.begin() as db:
+        if not await presence_is_current(db, project, now_ms()):
+            return
         other = aliased(Decision)
         unresolved = (
             select(other.id)
@@ -214,6 +278,7 @@ async def deliver(
                 Decision.server_id == settings.server_id,
                 Decision.state == "pending",
                 ~unresolved,
+                ~player_is_afk(Decision.project_id, Decision.steam_id),
             )
             .order_by(Decision.id)
             .limit(1)
@@ -221,22 +286,38 @@ async def deliver(
         )
         if row is None:
             return
+        if not await guard.available():
+            return
         sid = row.steam_id
         key = row.id
-        player = await db.get(Player, (project, sid))
-        if not player or player.is_whitelisted:
+        if await whitelisted(db, project, sid, lock=True):
             row.state = "cancelled"
             return
-        history, _ = await fetch_sessions(client, project, sid)
-        current = next(
-            (session for session in reversed(history) if session.server_id == row.server_id), None
-        )
+        current = await db.get(PlayerPresence, (project, sid))
+        if current is None or current.status != "online" or current.session_key != row.connected_at:
+            row.state = "cancelled"
+            return
+        now = now_ms()
         if (
-            not current
-            or current.is_license is not False
-            or current.disconnected_at is not None
-            or current.connected_at != row.connected_at
+            played_ms(await known_sessions(db, project, sid, current, now), settings.server_id, now)
+            > WHITELIST_PLAYTIME_MS
         ):
+            await whitelist_for_playtime(db, project, sid)
+            row.state = "cancelled"
+            return
+        profile_observed_at = time_ns()
+        profile, details = await fetch_profile(client, project, sid)
+        if (
+            await cache_profile(db, project, sid, details)
+            or profile.last_no_license is not True
+            or profile.server_id != row.server_id
+        ):
+            row.state = "cancelled"
+            return
+        if profile.status == "afk":
+            await save_presence(db, project, {sid: "afk"}, profile_observed_at)
+            return
+        if profile.status != "online":
             row.state = "cancelled"
             return
         allowed = {
@@ -244,25 +325,33 @@ async def deliver(
             for code, match in row.matches.items()
             if getattr(settings.patterns, code).action == "ban"
             and match["settings"]["action"] == "ban"
+            and (code != "P07" or "window_start" in match["evidence"])
         }
         if "P01" not in allowed:
             allowed.pop("P02", None)
         for code in PRIORITY:
             if code not in allowed or code == "P01":
                 continue
-            if code in {"P02", "P04"} and not await valid_reference(
-                db, client, project, code, allowed[code]["evidence"]
-            ):
-                continue
+            reference_ban_id = None
+            if code in {"P02", "P04"}:
+                reference_ban_id = await valid_reference(
+                    db, client, project, code, allowed[code]["evidence"]
+                )
+                if reference_ban_id is None:
+                    continue
             pattern = code
             break
         else:
             row.state = "cancelled"
             return
         row.primary_pattern = pattern
+        row.reference_ban_id = reference_ban_id
         marker = f"{MARKER}{key}:{pattern}"
-        reason = describe(pattern, allowed[pattern])
-        target_ip = current.ban_ip
+        reason = describe(pattern, allowed[pattern], reference_ban_id=reference_ban_id)
+        try:
+            target_ip = str(ip_address(profile.ip))
+        except ValueError:
+            target_ip = None
         if target_ip is None:
             row.state = "failed"
             logger.error(
@@ -275,7 +364,7 @@ async def deliver(
                 reason,
             )
             return
-        async for ban in player_bans(client, project, sid):
+        async for ban in player_bans(db, client, project, sid):
             if covers_requested_ban(ban, target_ip):
                 row.state = "superseded"
                 row.external_id = ban["id"]
@@ -290,7 +379,6 @@ async def deliver(
                 )
                 return
         row.ban_ip = target_ip
-        row.state = "sending"
         body = {
             "steam_id": sid,
             "ban_ip_active": True,
@@ -301,17 +389,40 @@ async def deliver(
             "comment": f"{marker} | {reason}",
             "destroy_buildings": False,
         }
-    logger.info(
-        "Отправка бессрочного бана на все серверы проекта по SteamID и IP | "
-        "решение=%s SteamID=%s проект=%s паттерн=%s | %s",
-        key,
-        sid,
-        project,
-        pattern,
-        reason,
-    )
+    if not await guard.claim(key, pattern, target_ip):
+        return
     try:
-        await client.put_player_ban(sid, {"bans": [body], "override_broadcast": False})
+        async with sessions.begin() as db:
+            trusted = await whitelisted(db, project, sid, lock=True)
+            claimed = await db.get(Decision, key, with_for_update=True)
+            if claimed.state != "sending":
+                return
+            if trusted:
+                claimed.state = "cancelled"
+                return
+            presence = await db.get(PlayerPresence, (project, sid))
+            if presence is None or presence.session_key != claimed.connected_at:
+                claimed.state = "cancelled"
+                return
+            if presence.status != "online":
+                claimed.state = "pending"
+                return
+            logger.info(
+                "Отправка бессрочного бана на все серверы проекта по SteamID и IP | "
+                "решение=%s SteamID=%s проект=%s паттерн=%s | %s",
+                key,
+                sid,
+                project,
+                pattern,
+                reason,
+            )
+            await client.put_player_ban(sid, {"bans": [body], "override_broadcast": False})
+    except (PlayerNotOnline, RustAppRequestNotSent):
+        async with sessions.begin() as db:
+            claimed = await db.get(Decision, key, with_for_update=True)
+            if claimed.state == "sending":
+                claimed.state = "pending"
+        raise
     except RustAppTransportError:
         logger.warning(
             "Результат отправки неизвестен, ожидаем сверки | решение=%s SteamID=%s паттерн=%s | %s",
@@ -338,7 +449,9 @@ async def deliver(
         raise
 
 
-async def reconcile(db: AsyncSession, client: RustAppClient, project: int, server: int) -> None:
+async def reconcile(
+    db: AsyncSession, client: RustAppClient, project: int, server: int, *, cached_only: bool = False
+) -> set[int]:
     sending = await db.scalars(
         select(Decision)
         .where(
@@ -348,33 +461,68 @@ async def reconcile(db: AsyncSession, client: RustAppClient, project: int, serve
         )
         .order_by(Decision.id)
     )
+    needs_project_sync: set[int] = set()
     for row in sending:
         marker = f"{MARKER}{row.id}:{row.primary_pattern}"
-        async for ban in player_bans(client, project, row.steam_id):
-            if str(ban.get("comment", "")).partition(" | ")[0] == marker:
-                row.external_id = ban["id"]
-                reason = describe(row.primary_pattern, row.matches[row.primary_pattern])
-                if row.ban_ip is not None and not covers_requested_ban(ban, row.ban_ip):
-                    row.state = "failed"
-                    logger.error(
-                        "Параметры бана в RustApp расходятся с запросом | бан=%s "
-                        "решение=%s SteamID=%s паттерн=%s | %s",
-                        ban["id"],
-                        row.id,
-                        row.steam_id,
-                        row.primary_pattern,
-                        reason,
-                    )
-                    break
-                row.state = "confirmed"
-                logger.info(
-                    "Блокировка подтверждена RustApp | бан=%s решение=%s SteamID=%s "
-                    "проект=%s паттерн=%s | %s",
-                    ban["id"],
-                    row.id,
-                    row.steam_id,
-                    project,
-                    row.primary_pattern,
-                    reason,
-                )
-                break
+        ban = await db.scalar(
+            select(ReferenceBan.payload)
+            .where(
+                ReferenceBan.project_id == project,
+                ReferenceBan.steam_id == row.steam_id,
+                func.split_part(ReferenceBan.payload["comment"].astext, " | ", 1) == marker,
+            )
+            .order_by(ReferenceBan.at.desc())
+            .limit(1)
+        )
+        if ban is None:
+            presence = await db.get(PlayerPresence, (project, row.steam_id))
+            query_player = (
+                not cached_only
+                and presence is not None
+                and presence.status == "online"
+                and await presence_is_current(db, project, now_ms())
+                and not await whitelisted(db, project, row.steam_id, lock=True)
+            )
+            if not query_player:
+                needs_project_sync.add(row.id)
+                continue
+            try:
+                async with aclosing(player_bans(db, client, project, row.steam_id)) as candidates:
+                    async for candidate in candidates:
+                        if str(candidate.get("comment", "")).partition(" | ")[0] == marker:
+                            ban = candidate
+                            break
+            except PlayerNotOnline:
+                needs_project_sync.add(row.id)
+            if ban is None:
+                continue
+        row.external_id = ban["id"]
+        reason = describe(
+            row.primary_pattern,
+            row.matches[row.primary_pattern],
+            reference_ban_id=row.reference_ban_id,
+        )
+        if row.ban_ip is not None and not covers_requested_ban(ban, row.ban_ip):
+            row.state = "failed"
+            logger.error(
+                "Параметры бана в RustApp расходятся с запросом | бан=%s "
+                "решение=%s SteamID=%s паттерн=%s | %s",
+                row.external_id,
+                row.id,
+                row.steam_id,
+                row.primary_pattern,
+                reason,
+            )
+            continue
+        row.state = "confirmed"
+        logger.info(
+            "Блокировка подтверждена RustApp | бан=%s решение=%s SteamID=%s "
+            "проект=%s паттерн=%s | %s",
+            row.external_id,
+            row.id,
+            row.steam_id,
+            project,
+            row.primary_pattern,
+            reason,
+        )
+    return needs_project_sync

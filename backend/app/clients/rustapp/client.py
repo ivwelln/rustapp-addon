@@ -1,13 +1,21 @@
+import logging
 from collections.abc import Mapping
+from time import perf_counter
 
 import httpx2
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.clients.rustapp.exceptions import (
     RustAppHTTPError,
+    RustAppRequestNotSent,
     RustAppTimeoutError,
     RustAppTransportError,
 )
 from app.core.config import Settings
+from app.crud.rustapp_requests import record_request
+
+logger = logging.getLogger(__name__)
 
 RUSTAPP_BASE_URL = httpx2.URL("https://court.rustapp.io")
 RUSTAPP_CORE_URL = httpx2.URL("https://core.rustapp.io")
@@ -25,9 +33,17 @@ def create_rustapp_http_client(
     *,
     transport: httpx2.AsyncBaseTransport | None = None,
     base_url: httpx2.URL = RUSTAPP_BASE_URL,
+    request_log: async_sessionmaker[AsyncSession] | None = None,
 ) -> httpx2.AsyncClient:
     if base_url not in (RUSTAPP_BASE_URL, RUSTAPP_CORE_URL):
         raise ValueError("Недопустимый адрес RustApp")
+
+    async def record(_request: httpx2.Request) -> None:
+        try:
+            await record_request(request_log)
+        except (SQLAlchemyError, OSError) as exc:
+            raise RustAppRequestNotSent("Не удалось записать время запроса RustApp") from exc
+
     return httpx2.AsyncClient(
         base_url=base_url,
         headers={
@@ -40,6 +56,7 @@ def create_rustapp_http_client(
         follow_redirects=False,
         trust_env=False,
         transport=transport,
+        event_hooks={"request": [record]} if request_log is not None else None,
     )
 
 
@@ -63,17 +80,36 @@ class RustAppClient:
         return await self._send(request)
 
     async def _send(self, request: httpx2.Request) -> httpx2.Response:
-
         if _origin(request.url) != self._expected_origin or request.url.userinfo:
             raise ValueError("Запрос выходит за пределы адреса клента RustApp")
 
+        method, path = request.method, request.url.path
+        started = perf_counter()
+        logger.debug("RustApp: отправка %s %s", method, path)
         try:
             response = await self._http.send(request, follow_redirects=False)
         except httpx2.TimeoutException:
+            logger.warning(
+                "RustApp: тайм-аут %s %s | %.0f мс", method, path, (perf_counter() - started) * 1000
+            )
             raise RustAppTimeoutError("Истекло время ожидания ответа от RustApp") from None
-        except httpx2.RequestError:
+        except httpx2.RequestError as exc:
+            logger.warning(
+                "RustApp: ошибка транспорта %s %s | %s", method, path, type(exc).__name__
+            )
             raise RustAppTransportError("Не удалось выполнить запрос к RustApp") from None
+        except RustAppTransportError:
+            logger.warning("RustApp: запрос %s %s остановлен при записи в PostgreSQL", method, path)
+            raise
 
+        logger.log(
+            logging.INFO if response.is_success else logging.WARNING,
+            "RustApp: %s %s | HTTP %d | %.0f мс",
+            method,
+            path,
+            response.status_code,
+            (perf_counter() - started) * 1000,
+        )
         if not response.is_success:
             raise RustAppHTTPError(
                 response.status_code,

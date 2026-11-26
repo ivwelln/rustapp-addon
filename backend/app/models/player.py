@@ -20,3 +20,4 @@ class Player(Base):
     last_client_kind: Mapped[str] = mapped_column(Text, server_default=text("'unknown'"))
     client_kind_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_whitelisted: Mapped[bool] = mapped_column(server_default=false())
+    whitelist_reason: Mapped[str | None] = mapped_column(Text)

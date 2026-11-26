@@ -2,7 +2,7 @@ from app.services.moderation.facts import MINUTE, Facts, RecentBan
 
 
 def evaluate(facts: Facts, rule: RecentBan) -> dict | None:
-    if not (facts.private_without_date and facts.first_join):
+    if not (facts.private_without_date and facts.first_join and facts.connection_observed):
         return None
     connected = facts.session.connected_at
     ids = [
