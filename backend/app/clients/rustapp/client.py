@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.clients.rustapp.exceptions import (
     RustAppHTTPError,
+    RustAppRequestNotSent,
     RustAppTimeoutError,
     RustAppTransportError,
 )
@@ -41,7 +42,7 @@ def create_rustapp_http_client(
         try:
             await record_request(request_log)
         except (SQLAlchemyError, OSError) as exc:
-            raise RustAppTransportError("Не удалось записать время запроса RustApp") from exc
+            raise RustAppRequestNotSent("Не удалось записать время запроса RustApp") from exc
 
     return httpx2.AsyncClient(
         base_url=base_url,

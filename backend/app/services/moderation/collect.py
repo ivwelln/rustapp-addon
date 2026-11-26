@@ -2,7 +2,7 @@ import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.rustapp.client import RustAppClient
@@ -12,10 +12,11 @@ from app.core.config import ModerationSettings
 from app.crud.moderation import archive, now_ms, reference_bans, save_decision, save_kill
 from app.crud.player_data import save_ip, save_reports
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
-from app.crud.presence import PRESENT, observe_server
-from app.models import CollectionJob, CombatKill, PlayerData, PlayerPresence
+from app.crud.presence import PRESENT, observe_server, presence_is_current
+from app.models import CollectionJob, CombatKill, PlayerData, PlayerPresence, ReferenceBan
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
+from app.services.moderation.kill_feed import PAGE_LIMIT, update_coverage
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,18 @@ async def fetch_profile(client: RustAppClient, project: int, sid: str) -> tuple[
 async def cache_profile(db: AsyncSession, project: int, sid: str, data: dict) -> bool:
     await archive(db, project, sid, "details", data)
     raw_player = data["player"]
+    signed_at = (raw_player.get("steam_data") or {}).get("signed_at")
+    if type(signed_at) is int and signed_at > 0:
+        await db.execute(
+            update(ReferenceBan)
+            .where(
+                ReferenceBan.project_id == project,
+                ReferenceBan.steam_id == sid,
+                ReferenceBan.eligible,
+                ReferenceBan.signed_at.is_(None),
+            )
+            .values(signed_at=signed_at)
+        )
     await save_ip(
         db,
         project,
@@ -60,6 +73,8 @@ async def collect(
         return
 
     now = now_ms()
+    if not await presence_is_current(db, project, now):
+        return
     presence = await db.get(PlayerPresence, (project, sid))
     if presence is None or presence.active_since is None:
         awaiting_entry = presence is None or presence.status in ("joining", None)
@@ -143,16 +158,19 @@ async def collect(
                     address.get("last_seen_at") or address.get("created_at") or now,
                     address,
                 )
+    feed_start = now - 30 * 1440 * MINUTE
     data = await read(
         client,
         base + "kill-feed",
         page=0,
-        limit=25,
-        time_from=now - 30 * 1440 * MINUTE,
+        limit=PAGE_LIMIT,
+        time_from=feed_start,
         time_to=now,
     )
     await archive(db, project, sid, "kill-feed", data)
-    for row in results(data):
+    rows = results(data)
+    update_coverage(job, data, rows, start=feed_start, end=now)
+    for row in rows:
         if row["project_id"] != project:
             raise RustAppResponseError("Получено событие другого проекта")
         if (kill := parse_kill(row, sid)) is not None:
@@ -163,7 +181,12 @@ async def collect(
     presence = await db.get(
         PlayerPresence, (project, sid), populate_existing=True, with_for_update=True
     )
-    if presence is None or presence.active_since != active_since or presence.status != "online":
+    if (
+        presence is None
+        or presence.active_since != active_since
+        or presence.status != "online"
+        or not await presence_is_current(db, project, now_ms())
+    ):
         return
     if observed_profile_at is not None:
         if profile.status not in PRESENT:
@@ -183,7 +206,7 @@ async def collect(
         steam_id=sid,
         server_id=settings.server_id,
         connected_at=presence.session_key,
-        joined_at=presence.joined_at or active_since,
+        joined_at=presence.joined_at,
         is_license=False,
     )
     start = active_since
@@ -231,13 +254,21 @@ async def collect(
         connection_observed=presence.connecting_at is not None,
     )
     matches = evaluate(facts, rules, entry=True) if first_join else {}
+    covered_from = job.kill_feed_covered_from
+    if covered_from is not None:
+        covered_from = max(covered_from, lower)
     # Revisit the recent window after reconnects or late publication of a hit log.
     for kill in kills:
         if kill.created_at < start:
             continue
-        for code, result in evaluate(
-            replace(facts, at=kill.created_at), rules, entry=False
-        ).items():
+        covered = (
+            covered_from
+            if job.kill_feed_covered_through is not None
+            and kill.created_at <= job.kill_feed_covered_through
+            else None
+        )
+        event_facts = replace(facts, at=kill.created_at, kill_feed_covered_from=covered)
+        for code, result in evaluate(event_facts, rules, entry=False).items():
             matches.setdefault(code, result)
     logger.debug(
         "Модерация: паттерны проверены | SteamID=%s убийств=%d совпадения=%s",

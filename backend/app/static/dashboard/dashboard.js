@@ -12,6 +12,11 @@ const labels = {
   confirmed: ["Бан подтверждён", "good"], superseded: ["Уже заблокирован", ""],
   failed: ["Ошибка", "error"], cancelled: ["Отменено", ""], recorded: ["Зафиксировано", ""],
 };
+const verdicts = {
+  confirmed_cheating: "Чит подтверждён", false_positive: "Ложное срабатывание",
+  inconclusive: "Недостаточно доказательств",
+};
+const evidenceTime = new Intl.DateTimeFormat("ru-RU", {dateStyle: "medium", timeStyle: "medium"});
 let snapshot = null;
 let activeTab = "players";
 let presenceFilter = "all";
@@ -83,15 +88,127 @@ function rosterRow(record) {
 
 function decisionRow(record) {
   const row = element("tr", "");
-  const explanation = element("td", record.pattern);
+  const explanation = element("td", "");
+  const open = element("button", `${record.pattern} · №${record.id}`, "decision-link");
+  open.type = "button";
+  open.addEventListener("click", () => openDecision(record.id));
+  explanation.append(open);
   if (record.reason) explanation.append(element("span", record.reason, "detail"));
   const status = element("td", "");
   status.append(badge(record.state));
   if (record.ban_id) status.append(element("span", `Бан №${record.ban_id}`, "detail"));
+  if (record.verdict) status.append(element("span", verdicts[record.verdict], "detail"));
   row.append(element("td", record.steam_id, "steam"), explanation, status,
     valueCell(record.at ? dateTime.format(record.at) : null));
   return row;
 }
+
+function evidenceDate(value) {
+  return Number.isFinite(value) ? evidenceTime.format(value) : "—";
+}
+
+function factsList(entries) {
+  const list = element("dl", "", "evidence-facts");
+  for (const [label, value] of entries) {
+    if (value != null) list.append(element("dt", label), element("dd", value));
+  }
+  return list;
+}
+
+function renderDecision(record) {
+  const body = get("decision-evidence");
+  body.replaceChildren(factsList([
+    ["SteamID", record.steam_id], ["Сервер", record.server_id],
+    ["Вход в игру", evidenceDate(record.joined_at)], ["Состояние", labels[record.state]?.[0]],
+    ["Бан RustApp", record.ban_id], ["Проверенный исходный бан", record.reference_ban_id],
+  ]));
+  if (record.reason) body.append(element("p", record.reason));
+  for (const rule of record.rules) {
+    const section = element("section", "");
+    const settings = rule.settings;
+    const evidence = rule.evidence;
+    section.append(element("h3", `${rule.code} · версия ${settings.version ?? "—"}`));
+    section.append(factsList([
+      ["Срабатывание", evidenceDate(rule.at)], ["Окно, мин", settings.minutes],
+      ["Число жертв", settings.victims], ["Дистанция от, м", settings.meters],
+      ["Попаданий на жертву", settings.hits], ["Минимум убийств", settings.kills],
+      ["Порог попаданий в голову, %", settings.percent], ["Возраст профиля, мин", settings.age_minutes],
+      ["Допуск даты Steam, с", settings.tolerance_seconds],
+      ["Дата регистрации Steam", evidence.signed_at && evidenceDate(evidence.signed_at)],
+      ["Профиль создан", evidence.first_seen && evidenceDate(evidence.first_seen)],
+      ["Начало полного окна", evidence.window_start && evidenceDate(evidence.window_start)],
+      ["Убийства в голову", evidence.total != null ? `${evidence.heads} из ${evidence.total}` : null],
+      ["Исходные баны", evidence.prior_bans?.map((id) => `№${id}`).join(", ")],
+      ["Закрытый Steam без даты", evidence.private_without_date ? "Да" : null],
+    ]));
+    for (const ban of evidence.bans) {
+      section.append(element("p", `Бан №${ban.id} · ${evidenceDate(ban.at)} · Steam ${evidenceDate(ban.signed_at)}`));
+    }
+    if (evidence.kills.length) {
+      const list = element("ul", "", "evidence-list");
+      for (const kill of evidence.kills) {
+        const distance = kill.distance == null ? "" : ` · ${number.format(kill.distance)} м`;
+        const head = kill.head ? " · В голову" : "";
+        const hits = kill.head_hits_only ? ` · Попаданий в голову ${kill.head_hits_only}` : "";
+        list.append(element("li", `${evidenceDate(kill.created_at)} · №${kill.id} · ${kill.victim} · ${kill.weapon || "—"}${distance}${head}${hits}`));
+      }
+      section.append(list);
+    }
+    body.append(section);
+  }
+  get("verdict").value = record.verdict || "";
+  get("verdict-note").value = record.verdict_note || "";
+  get("decision-review").hidden = false;
+  decisionMessage(record.verdict_at ? `Сохранено ${evidenceDate(record.verdict_at)}` : "");
+}
+
+function decisionMessage(message, error = false) {
+  const notice = get("decision-message");
+  notice.textContent = message;
+  notice.dataset.error = error;
+}
+
+async function fetchDecision(id, options) {
+  const response = await fetch(`/api/dashboard/decisions/${id}`, options);
+  const result = await response.json();
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Проверьте данные формы");
+  return result;
+}
+
+async function openDecision(id) {
+  const card = get("decision-card");
+  card.dataset.id = id;
+  get("decision-title").textContent = `Решение №${id}`;
+  get("decision-evidence").replaceChildren();
+  get("decision-review").hidden = true;
+  decisionMessage("Загружаем доказательства…");
+  card.showModal();
+  try {
+    const record = await fetchDecision(id);
+    if (card.open && card.dataset.id === String(id)) renderDecision(record);
+  } catch (error) {
+    if (card.open && card.dataset.id === String(id)) decisionMessage(error.message, true);
+  }
+}
+
+get("decision-review").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const card = get("decision-card");
+  const id = card.dataset.id;
+  const save = get("save-verdict");
+  save.disabled = true;
+  try {
+    const record = await fetchDecision(id, {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({verdict: get("verdict").value, note: get("verdict-note").value}),
+    });
+    if (card.open && card.dataset.id === id) renderDecision(record);
+  } catch (error) {
+    if (card.open && card.dataset.id === id) decisionMessage(error.message, true);
+  } finally {
+    save.disabled = false;
+  }
+});
 
 function renderActivity() {
   const players = activeTab === "players";

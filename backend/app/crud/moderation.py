@@ -181,6 +181,7 @@ async def save_decision(
             steam_id=session.steam_id,
             server_id=session.server_id,
             connected_at=session.connected_at,
+            joined_at=session.joined_at,
             matches={},
             state="recorded",
         )
@@ -190,6 +191,10 @@ async def save_decision(
         return
     previous_primary = decision.primary_pattern
     previous = decision.matches
+    if "P07" in matches and "window_start" not in previous.get("P07", {}).get("evidence", {}):
+        previous = {code: match for code, match in previous.items() if code != "P07"}
+    if decision.joined_at is None:
+        decision.joined_at = session.joined_at
     decision.matches = {**matches, **previous}
     decision.primary_pattern, decision.action = outcome(decision.matches)
     if not enforce and decision.action == "ban" and decision.primary_pattern != previous_primary:

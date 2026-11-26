@@ -84,5 +84,26 @@
       <div class="axis" aria-hidden="true"><span>−60 мин</span><span>−30 мин</span><span>Сейчас</span></div>
     </section>
   </main>
+  <dialog id="decision-card" aria-labelledby="decision-title">
+    <div class="panel-head">
+      <h2 id="decision-title">Решение модерации</h2>
+      <form method="dialog"><button class="refresh" type="submit">Закрыть</button></form>
+    </div>
+    <div id="decision-evidence"></div>
+    <form id="decision-review" hidden>
+      <h3>Вердикт модератора</h3>
+      <label for="verdict">Результат проверки</label>
+      <select id="verdict" required>
+        <option value="">Выбрать результат</option>
+        <option value="confirmed_cheating">Чит подтверждён</option>
+        <option value="false_positive">Ложное срабатывание</option>
+        <option value="inconclusive">Недостаточно доказательств</option>
+      </select>
+      <label for="verdict-note">Комментарий</label>
+      <textarea id="verdict-note" maxlength="2000" rows="3"></textarea>
+      <button id="save-verdict" class="refresh" type="submit">Сохранить вердикт</button>
+    </form>
+    <p id="decision-message" role="status"></p>
+  </dialog>
 </body>
 </html>

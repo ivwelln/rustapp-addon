@@ -1,13 +1,37 @@
 from collections.abc import Mapping
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.moderation import CollectionJob
-from app.models.player_data import ObservedPlay, PlayerPresence
+from app.models.player_data import ObservedPlay, PlayerPresence, PresenceHeartbeat
 from app.schemas.rustapp.realtime import PlayerStatus
 
 PRESENT = ("online", "afk")
+PRESENCE_TIMEOUT_MS = 60_000
+
+
+async def confirm_presence_connection(db: AsyncSession, project: int, at: int) -> None:
+    statement = insert(PresenceHeartbeat).values(project_id=project, confirmed_at=at)
+    await db.execute(
+        statement.on_conflict_do_update(
+            index_elements=[PresenceHeartbeat.project_id],
+            set_={"confirmed_at": at},
+            where=PresenceHeartbeat.confirmed_at < at,
+        )
+    )
+
+
+async def confirmed_presence_at(db: AsyncSession, project: int) -> int | None:
+    return await db.scalar(
+        select(PresenceHeartbeat.confirmed_at).where(PresenceHeartbeat.project_id == project)
+    )
+
+
+async def presence_is_current(db: AsyncSession, project: int, now: int) -> bool:
+    confirmed = await confirmed_presence_at(db, project)
+    return confirmed is not None and now - PRESENCE_TIMEOUT_MS <= confirmed <= now
 
 
 def player_is_afk(project, steam_id):
@@ -185,6 +209,11 @@ async def save_presence(
 
 
 async def invalidate_presence(db: AsyncSession, project: int, observed_at: int) -> None:
+    confirmed = await db.scalar(
+        delete(PresenceHeartbeat)
+        .where(PresenceHeartbeat.project_id == project)
+        .returning(PresenceHeartbeat.confirmed_at)
+    )
     players = await db.scalars(
         select(PlayerPresence)
         .where(
@@ -195,4 +224,6 @@ async def invalidate_presence(db: AsyncSession, project: int, observed_at: int) 
         .with_for_update()
     )
     for player in players:
+        if confirmed is not None:
+            end_server_observation(db, player, min(confirmed, observed_at // 1_000_000))
         transition(db, player, None, observed_at, complete_snapshot=True)

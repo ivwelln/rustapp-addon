@@ -35,7 +35,13 @@ from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, get_settings
 from app.core.logging import configure_console_logging
 from app.crud.moderation import enqueue
-from app.crud.presence import invalidate_presence, remove_offline_jobs, save_presence
+from app.crud.presence import (
+    PRESENCE_TIMEOUT_MS,
+    confirm_presence_connection,
+    invalidate_presence,
+    remove_offline_jobs,
+    save_presence,
+)
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer
 from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
@@ -88,6 +94,8 @@ class PlayerStatusEvents(SubscriptionEventHandler):
         self._snapshot_refresh_not_before = 0.0
         self._snapshot_task: asyncio.Task[None] | None = None
         self._snapshot_queued = False
+        self._last_signal_at = 0
+        self._subscribed = False
 
     def cancel_snapshot(self) -> None:
         if self._snapshot_task is not None:
@@ -95,6 +103,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             self._snapshot_task = None
 
     async def on_subscribing(self, ctx: SubscribingContext) -> None:
+        self._subscribed = False
         self.cancel_snapshot()
         self._snapshot_queued = False
 
@@ -108,9 +117,12 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             self.cancel_snapshot()
             self._snapshot_task = self._tasks.create_task(self._load_snapshot())
 
+        self._last_signal_at = time_ns() // 1_000_000
+        self._subscribed = True
         logger.info("Подписка активна: %s", ctx.channel)
 
     async def on_unsubscribed(self, ctx: UnsubscribedContext) -> None:
+        self._subscribed = False
         self.cancel_snapshot()
         logger.info("Подписка завершилась: %d", ctx.code)
         self._stopped.set()
@@ -118,6 +130,7 @@ class PlayerStatusEvents(SubscriptionEventHandler):
     async def _load_snapshot(self, *, refresh: bool = False) -> None:
         task = asyncio.current_task()
         loop = asyncio.get_running_loop()
+        retry_delay = SNAPSHOT_MIN_RETRY_SECONDS
 
         try:
             while self._snapshot_task is task:
@@ -135,20 +148,19 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                 try:
                     self._snapshot_refresh_not_before = loop.time() + SNAPSHOT_MIN_INTERVAL_SECONDS
                     players = await self._fetch_snapshot()
-                except RustAppHTTPError as exc:
+                except RustAppError as exc:
                     if self._snapshot_task is not task:
                         return
-                    if exc.status_code != 429 and (
-                        exc.status_code != 503 or exc.retry_after is None
-                    ):
-                        raise
-
-                    delay = parse_retry_after(exc.retry_after)
-                    if delay is None:
-                        delay = SNAPSHOT_RETRY_FALLBACK_SECONDS
-                    delay = max(SNAPSHOT_MIN_RETRY_SECONDS, delay)
+                    delay = retry_delay
+                    if isinstance(exc, RustAppHTTPError):
+                        retry_after = parse_retry_after(exc.retry_after)
+                        if retry_after is not None:
+                            delay = max(delay, retry_after)
+                        elif exc.status_code in (401, 403, 429):
+                            delay = SNAPSHOT_RETRY_FALLBACK_SECONDS
+                    retry_delay = min(retry_delay * 2, SNAPSHOT_RETRY_FALLBACK_SECONDS)
                     self._snapshot_retry_not_before = loop.time() + delay
-                    logger.warning("HTTP-сверка: HTTP %d. Пауза %.1f с.", exc.status_code, delay)
+                    logger.warning("HTTP-сверка игроков не удалась: %s. Пауза %.1f с.", exc, delay)
                     continue
 
                 if self._snapshot_task is task:
@@ -172,14 +184,34 @@ class PlayerStatusEvents(SubscriptionEventHandler):
                     )
                     self._snapshot_loaded = True
                 return
-        except RustAppError as exc:
-            if self._snapshot_task is task:
-                logger.warning("HTTP-сверка игроков не удалась: %s", exc)
         finally:
             if self._snapshot_task is task:
                 self._snapshot_task = None
                 if self._snapshot_queued and self._snapshot_loaded:
                     self._snapshot_task = self._tasks.create_task(self._load_snapshot(refresh=True))
+
+    async def monitor_connection(self, client: RustAppRealtimeClient) -> None:
+        saved = 0
+        while not self._stopped.is_set():
+            if self._subscribed:
+                confirmed = max(self._last_signal_at, client.last_ping_at)
+                if time_ns() // 1_000_000 - confirmed > PRESENCE_TIMEOUT_MS or (
+                    saved and confirmed - saved > PRESENCE_TIMEOUT_MS
+                ):
+                    logger.warning("RustApp WebSocket: время ожидания подтверждения связи истекло")
+                    self._stopped.set()
+                    return
+                if self._snapshot_loaded and confirmed > saved:
+                    try:
+                        async with self._db_sessions.begin() as db:
+                            await confirm_presence_connection(db, self._project_id, confirmed)
+                    except (OSError, SQLAlchemyError) as exc:
+                        logger.warning(
+                            "Не удалось подтвердить связь слушателя (%s)", type(exc).__name__
+                        )
+                    else:
+                        saved = confirmed
+            await asyncio.sleep(5)
 
     async def clear_presence(self) -> None:
         try:
@@ -285,10 +317,12 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             return
 
         logger.debug("RustApp WebSocket: получены статусы | игроков=%d", len(update.players))
+        observed_at = time_ns()
         joined, discovered = self._sessions.apply(update.players)
         await self._update_presence(
-            update.players, time_ns(), joined=tuple(joined), discovered=tuple(discovered)
+            update.players, observed_at, joined=tuple(joined), discovered=tuple(discovered)
         )
+        self._last_signal_at = max(self._last_signal_at, observed_at // 1_000_000)
         if joined or discovered:
             if self._snapshot_task is not None:
                 self._snapshot_queued = True
@@ -379,6 +413,7 @@ async def run_listener() -> int:
             tasks=tasks,
         )
         subscription = client.new_subscription(channel, events=status_events)
+        heartbeat = tasks.create_task(status_events.monitor_connection(client))
 
         try:
             await client.connect()
@@ -388,6 +423,7 @@ async def run_listener() -> int:
         except CentrifugeError as exc:
             logger.error("Слушатель RustApp завершился: %s", type(exc).__name__)
         finally:
+            heartbeat.cancel()
             status_events.cancel_snapshot()
             await client.disconnect()
             await status_events.clear_presence()

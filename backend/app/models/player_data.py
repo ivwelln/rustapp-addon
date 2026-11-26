@@ -77,3 +77,10 @@ class ObservedPlay(Base):
     server_id: Mapped[int]
     ended_at: Mapped[int] = mapped_column(BigInteger)
     is_pirated: Mapped[bool | None]
+
+
+class PresenceHeartbeat(Base):
+    __tablename__ = "rustapp_presence_heartbeat"
+
+    project_id: Mapped[int] = mapped_column(primary_key=True)
+    confirmed_at: Mapped[int] = mapped_column(BigInteger)

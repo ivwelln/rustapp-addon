@@ -12,13 +12,15 @@ from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, ModerationSettings, get_settings
 from app.core.logging import configure_console_logging
 from app.crud.moderation import now_ms
-from app.crud.presence import player_is_online
+from app.crud.presence import player_is_online, presence_is_current
 from app.db.session import open_database_sessions
 from app.models import CollectionJob, PlayerPresence
 from app.services.moderation.bans import deliver, reconcile, sync_bans
 from app.services.moderation.collect import collect
 
 logger = logging.getLogger(__name__)
+BAN_SYNC_SECONDS = 5 * 60
+BAN_RECONCILE_SECONDS = 60
 
 
 async def run() -> None:
@@ -59,38 +61,57 @@ async def run() -> None:
                 return
             async with sessions() as db:
                 presence = await db.get(PlayerPresence, (project, steam_id))
-                if presence is None or presence.status != "online":
+                if (
+                    presence is None
+                    or presence.status != "online"
+                    or not await presence_is_current(db, project, now_ms())
+                ):
                     logger.debug("RustApp: персональный запрос пропущен | SteamID=%s", steam_id)
                     raise PlayerNotOnline
 
         http.event_hooks["request"][:0] = [pace, skip_inactive_request]
         sync_due = 0.0
+        reconcile_due = 0.0
+        expedited: set[int] = set()
         while True:
             delay = 0
             job_key = None
             finished = False
             try:
-                if loop.time() >= sync_due:
-                    sync_due = loop.time() + 60
-                    logger.debug("Модерация: сверка истории банов и отправленных решений")
+                sync_project = loop.time() >= sync_due
+                if loop.time() >= reconcile_due:
+                    reconcile_due = loop.time() + BAN_RECONCILE_SECONDS
+                    if not sync_project:
+                        async with sessions.begin() as db:
+                            missing = await reconcile(db, client, project, settings.server_id)
+                        sync_project = bool(missing - expedited)
+                        expedited = missing
+                if sync_project:
+                    sync_due = loop.time() + BAN_RECONCILE_SECONDS
+                    logger.debug("Модерация: общая сверка истории банов")
                     async with sessions.begin() as db:
                         await sync_bans(
                             db, client, project, initial_pages=settings.initial_ban_pages
                         )
+                    sync_due = loop.time() + BAN_SYNC_SECONDS
                     async with sessions.begin() as db:
-                        await reconcile(db, client, project, settings.server_id)
-                async with sessions.begin() as db:
-                    job = await db.scalar(
-                        select(CollectionJob)
-                        .where(
-                            CollectionJob.project_id == project,
-                            CollectionJob.due_at <= now_ms(),
-                            player_is_online(CollectionJob.project_id, CollectionJob.steam_id),
+                        expedited = await reconcile(
+                            db, client, project, settings.server_id, cached_only=True
                         )
-                        .order_by(CollectionJob.due_at)
-                        .limit(1)
-                        .with_for_update(skip_locked=True)
-                    )
+                async with sessions.begin() as db:
+                    job = None
+                    if await presence_is_current(db, project, now_ms()):
+                        job = await db.scalar(
+                            select(CollectionJob)
+                            .where(
+                                CollectionJob.project_id == project,
+                                CollectionJob.due_at <= now_ms(),
+                                player_is_online(CollectionJob.project_id, CollectionJob.steam_id),
+                            )
+                            .order_by(CollectionJob.due_at)
+                            .limit(1)
+                            .with_for_update(skip_locked=True)
+                        )
                     if job:
                         job_key = (job.project_id, job.steam_id)
                         logger.debug(

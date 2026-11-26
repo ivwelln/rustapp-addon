@@ -4,17 +4,20 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ban_guard.quota import BAN_LIMIT, slots_used
+from app.crud.moderation import now_ms
 from app.models import CollectionJob, Decision, Player, PlayerPresence, RustAppRequest
+from app.services.dashboard.decisions import decision_details, decision_summary
 from app.services.dashboard.roster import online_players
-from app.services.moderation.evaluate import describe
 
 ASSETS = Path(__file__).resolve().parents[2] / "static" / "dashboard"
 HEADERS = {
@@ -46,16 +49,57 @@ async def asset(name: str) -> FileResponse:
     return FileResponse(ASSETS / name, headers=HEADERS)
 
 
-def reason(decision: Decision) -> str:
-    if decision.primary_pattern == "P01":
-        return "Совпадение даты регистрации Steam с ранее заблокированным аккаунтом"
-    match = decision.matches.get(decision.primary_pattern)
-    if not match:
-        return ""
+class ModeratorVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    verdict: Literal["confirmed_cheating", "false_positive", "inconclusive"]
+    note: str = Field(default="", max_length=2000)
+
+
+@router.get("/api/dashboard/decisions/{decision_id}", include_in_schema=False)
+async def read_decision(request: Request, response: Response, decision_id: int) -> dict:
+    response.headers.update(HEADERS)
+    return await access_decision(request, decision_id)
+
+
+@router.put("/api/dashboard/decisions/{decision_id}", include_in_schema=False)
+async def review_decision(
+    request: Request, response: Response, decision_id: int, body: ModeratorVerdict
+) -> dict:
+    origin = request.headers.get("origin")
+    if origin is not None and origin != f"{request.url.scheme}://{request.url.netloc}":
+        raise HTTPException(status_code=403, detail="Запрос с другого сайта")
+    response.headers.update(HEADERS)
+    return await access_decision(request, decision_id, body)
+
+
+async def access_decision(
+    request: Request, decision_id: int, body: ModeratorVerdict | None = None
+) -> dict:
+    sessions = request.app.state.dashboard_sessions
+    if sessions is None:
+        raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
     try:
-        return describe(decision.primary_pattern, match)
-    except (KeyError, ValueError, TypeError):
-        return ""
+        async with sessions.begin() as db:
+            query = select(Decision).where(
+                Decision.id == decision_id,
+                Decision.project_id == request.app.state.dashboard_project,
+            )
+            decision = await db.scalar(query if body is None else query.with_for_update())
+            if decision is None:
+                raise HTTPException(status_code=404, detail="Решение не найдено", headers=HEADERS)
+            if body is not None and (body.verdict, body.note) != (
+                decision.verdict,
+                decision.verdict_note,
+            ):
+                decision.verdict = body.verdict
+                decision.verdict_note = body.note
+                decision.verdict_at = now_ms()
+            return decision_details(decision)
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
+        ) from None
 
 
 @router.get("/api/dashboard", include_in_schema=False)
@@ -194,16 +238,5 @@ async def read_snapshot(request: Request) -> dict:
         ],
         "guard": {"used": used, "limit": BAN_LIMIT},
         "players": roster,
-        "decisions": [
-            {
-                "id": decision.id,
-                "steam_id": decision.steam_id,
-                "state": decision.state,
-                "pattern": decision.primary_pattern,
-                "reason": reason(decision),
-                "ban_id": decision.external_id,
-                "at": decision.matches.get(decision.primary_pattern, {}).get("at"),
-            }
-            for decision in decisions
-        ],
+        "decisions": [decision_summary(decision) for decision in decisions],
     }

@@ -43,6 +43,7 @@ class HeadHits(Series):
 
 
 class Ratio(Rule):
+    version: int = Field(default=2, ge=1)
     minutes: int = Field(default=30, gt=0)
     kills: int = Field(default=5, gt=0)
     meters: float = Field(default=20, ge=0)
@@ -134,6 +135,7 @@ class Facts:
     kills: tuple[Kill, ...]
     bans: tuple[Ban, ...]
     connection_observed: bool = True
+    kill_feed_covered_from: int | None = None
 
 
 def recent_kills(facts: Facts, minutes: int) -> list[Kill]:

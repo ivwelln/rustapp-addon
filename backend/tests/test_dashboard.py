@@ -9,7 +9,7 @@ from app.crud.moderation import now_ms
 from app.crud.player_data import save_response
 from app.crud.presence import save_presence
 from app.main import app
-from app.models import CombatKill, Player
+from app.models import CombatKill, Decision, Player
 from app.services.dashboard.roster import DAY_MS, online_players
 
 
@@ -97,5 +97,66 @@ async def test_roster_only_shows_present_players_with_nontrusted_first():
         assert [player["kills"] for player in roster] == [1, None]
         assert roster[0]["name"] == "Zeta" and roster[0]["provider"] == "Network"
         assert roster[0]["country_code"] == "RU" and "ip" not in roster[0]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+async def test_decision_card_persists_local_verdict_and_shows_verified_reference(monkeypatch):
+    project = uuid4().int % (2**30) + 1
+    now = now_ms()
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    monkeypatch.setattr(app.state, "dashboard_sessions", sessions, raising=False)
+    monkeypatch.setattr(app.state, "dashboard_project", project, raising=False)
+    steam_id = "76561198000001231"
+    try:
+        async with sessions.begin() as db:
+            decision = Decision(
+                project_id=project,
+                steam_id=steam_id,
+                state="confirmed",
+                action="ban",
+                server_id=163,
+                connected_at=now,
+                joined_at=now,
+                primary_pattern="P02",
+                reference_ban_id=22,
+                external_id=33,
+                ban_ip="192.0.2.4",
+                matches={
+                    "P02": {
+                        "at": now,
+                        "settings": {"minutes": 60, "version": 1},
+                        "evidence": {
+                            "signed_at": now,
+                            "bans": [
+                                {"id": 11, "signed_at": now},
+                                {"id": 22, "signed_at": now},
+                            ],
+                        },
+                    }
+                },
+            )
+            db.add(decision)
+            await db.flush()
+            path = f"/api/dashboard/decisions/{decision.id}"
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(base_url="http://127.0.0.1", transport=transport) as client:
+            initial = await client.get(path)
+            assert initial.status_code == 200
+            assert initial.json()["joined_at"] == now
+            assert initial.json()["reference_ban_id"] == 22 and "№22" in initial.json()["reason"]
+            assert "192.0.2.4" not in initial.text
+            data = {"verdict": "false_positive", "note": "Ручная проверка"}
+            denied = await client.put(path, json=data, headers={"Origin": "https://other.example"})
+            assert denied.status_code == 403
+            saved = await client.put(path, json=data, headers={"Origin": "http://127.0.0.1"})
+            assert saved.status_code == 200
+            assert saved.json()["verdict_at"] >= now
+            assert (await client.get(path)).json() == saved.json()
+            assert saved.json()["state"] == "confirmed" and saved.json()["ban_id"] == 33
+            app.state.dashboard_project = project + 1
+            assert (await client.get(path)).status_code == 404
     finally:
         await engine.dispose()

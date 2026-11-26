@@ -12,6 +12,8 @@ class CollectionJob(Base):
     requested_at: Mapped[int] = mapped_column(BigInteger)
     collected_at: Mapped[int | None] = mapped_column(BigInteger)
     due_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    kill_feed_covered_from: Mapped[int | None] = mapped_column(BigInteger)
+    kill_feed_covered_through: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class Observation(Base):
@@ -70,6 +72,11 @@ class Decision(Base):
     matches: Mapped[dict] = mapped_column(JSONB)
     ban_ip: Mapped[str | None] = mapped_column(Text)
     external_id: Mapped[int | None] = mapped_column(BigInteger)
+    joined_at: Mapped[int | None] = mapped_column(BigInteger)
+    reference_ban_id: Mapped[int | None] = mapped_column(BigInteger)
+    verdict: Mapped[str | None] = mapped_column(Text)
+    verdict_note: Mapped[str | None] = mapped_column(Text)
+    verdict_at: Mapped[int | None] = mapped_column(BigInteger)
     __table_args__ = (
         Index(
             "uq_decision_session",

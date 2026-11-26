@@ -8,6 +8,7 @@ from app.models.player_data import (
     PlayerPresence,
     PlayerReport,
     PlayerSession,
+    PresenceHeartbeat,
 )
 from app.models.rustapp_request import RustAppRequest
 
@@ -17,6 +18,7 @@ __all__ = [
     "PlayerData",
     "PlayerIP",
     "PlayerPresence",
+    "PresenceHeartbeat",
     "ObservedPlay",
     "PlayerReport",
     "PlayerSession",

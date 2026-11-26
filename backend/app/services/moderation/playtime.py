@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud.player_data import stored_sessions
-from app.crud.presence import PRESENT
+from app.crud.presence import PRESENT, confirmed_presence_at
 from app.models import ObservedPlay, PlayerPresence
 from app.services.moderation.facts import MINUTE, Session
 
@@ -69,14 +69,17 @@ async def known_sessions(
         and presence.server_id is not None
         and presence.server_since is not None
     ):
-        records.append(
-            Session(
-                project_id=project,
-                steam_id=steam_id,
-                server_id=presence.server_id,
-                connected_at=presence.server_since,
-                joined_at=presence.server_since,
-                is_license=None if presence.is_pirated is None else not presence.is_pirated,
+        confirmed = await confirmed_presence_at(db, project)
+        if confirmed is not None and confirmed > presence.server_since:
+            records.append(
+                Session(
+                    project_id=project,
+                    steam_id=steam_id,
+                    server_id=presence.server_id,
+                    connected_at=presence.server_since,
+                    joined_at=presence.server_since,
+                    disconnected_at=min(confirmed, now),
+                    is_license=None if presence.is_pirated is None else not presence.is_pirated,
+                )
             )
-        )
     return sorted(records, key=lambda item: item.connected_at)

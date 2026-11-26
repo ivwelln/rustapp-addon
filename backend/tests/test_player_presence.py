@@ -1,6 +1,8 @@
 import asyncio
 import os
 from time import time_ns
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx2
@@ -9,12 +11,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
+from app.clients.rustapp.exceptions import RustAppTransportError
 from app.core.config import ModerationSettings, Settings
 from app.crud.moderation import enqueue, now_ms
 from app.crud.presence import is_afk, player_is_afk, player_is_online
 from app.models import CollectionJob, ObservedPlay, PlayerPresence
 from app.services.moderation.collect import collect
 from app.services.rustapp.player_sessions import PlayerSessionTracker
+from app.workers import listen_player_status
 from app.workers.listen_player_status import PlayerStatusEvents
 
 
@@ -24,6 +28,23 @@ def test_online_after_afk_is_not_a_new_connection():
     assert tracker.apply({"player": "online"}) == ([], [])
     tracker.apply({"player": "offline"})
     assert tracker.apply({"player": "online"}) == (["player"], [])
+
+
+async def test_initial_snapshot_retries_without_waiting_for_new_player(monkeypatch):
+    monkeypatch.setattr(listen_player_status, "SNAPSHOT_MIN_RETRY_SECONDS", 0.001)
+    async with asyncio.TaskGroup() as tasks:
+        listener = PlayerStatusEvents(
+            asyncio.Event(), court_client=None, db_sessions=None, project_id=1, tasks=tasks
+        )
+        fetch = AsyncMock(side_effect=[RustAppTransportError("test connection failure"), []])
+        monkeypatch.setattr(listener, "_fetch_snapshot", fetch)
+        monkeypatch.setattr(listener, "_persist_snapshot", AsyncMock())
+        monkeypatch.setattr(listener, "_update_presence", AsyncMock())
+        monkeypatch.setattr(listener, "clear_presence", AsyncMock())
+        await listener.on_subscribed(SimpleNamespace(recovered=False, channel="test"))
+        await asyncio.wait_for(listener._snapshot_task, timeout=1)
+        assert fetch.await_count == 2
+        assert listener._snapshot_loaded is True
 
 
 @pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
