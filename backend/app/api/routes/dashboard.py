@@ -71,6 +71,10 @@ async def asset(name: str) -> FileResponse:
     if name not in {
         "dashboard.css",
         "dashboard.js",
+        "rustapp-logo.js",
+        "logo-shaders.js",
+        "rustapp-mark.png",
+        "rustapp-mark.sdf",
         "rustapp.ico",
         "manrope-latin.woff2",
         "manrope-cyrillic.woff2",
