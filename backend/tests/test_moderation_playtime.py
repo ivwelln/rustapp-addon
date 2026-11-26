@@ -25,3 +25,4 @@ def test_playtime_uses_joined_at_and_clips_to_server_and_year():
         session(now - 60 * MINUTE, now - 50 * MINUTE, None),
     ]
     assert played_ms(records, 163, now) == (1 + 50 + 50) * MINUTE
+    assert played_ms(records, server_id=None, now=now) == (1 + 190 + 50 + 50) * MINUTE

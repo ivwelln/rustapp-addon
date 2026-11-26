@@ -1,6 +1,6 @@
 import re
 
-from sqlalchemy import BigInteger, case, func, select
+from sqlalchemy import BigInteger, case, column, func, select, table
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -9,6 +9,7 @@ from app.models import (
     CombatKill,
     Player,
     PlayerData,
+    PlayerPlaytime,
     PlayerPresence,
     PlayerReport,
 )
@@ -42,6 +43,23 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
             .subquery()
         )
 
+    research = table(
+        "research_case_status",
+        column("project_id"),
+        column("steam_id"),
+        column("status"),
+        column("version"),
+    )
+    trained = (
+        select(research.c.steam_id)
+        .where(
+            research.c.project_id == PlayerPresence.project_id,
+            research.c.steam_id == PlayerPresence.steam_id,
+            research.c.status == "ready",
+            research.c.version == 1,
+        )
+        .exists()
+    )
     kills = combat_counts(CombatKill)
     deaths = combat_counts(CombatDeath)
 
@@ -90,6 +108,7 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 PlayerPresence.status,
                 trusted.label("trusted"),
                 priority.label("priority"),
+                trained.label("trained"),
                 func.greatest(CollectionJob.collected_at, last_feed_at).label("checked_at"),
                 name.label("name"),
                 profile_field("steam_avatar").label("steam_avatar"),
@@ -102,6 +121,10 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 profile_field("ip_details", "country_name").label("country_name"),
                 kill_count.label("kills"),
                 death_count.label("deaths"),
+                PlayerPlaytime.observed_ms.label("observed_project_ms"),
+                PlayerPlaytime.project_ms.label("project_played_ms"),
+                PlayerPlaytime.project_days.label("playtime_days"),
+                PlayerPlaytime.project_day_end.label("playtime_as_of"),
             )
             .select_from(PlayerPresence)
             .outerjoin(
@@ -118,6 +141,11 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 CollectionJob,
                 (CollectionJob.project_id == PlayerPresence.project_id)
                 & (CollectionJob.steam_id == PlayerPresence.steam_id),
+            )
+            .outerjoin(
+                PlayerPlaytime,
+                (PlayerPlaytime.project_id == PlayerPresence.project_id)
+                & (PlayerPlaytime.steam_id == PlayerPresence.steam_id),
             )
             .outerjoin(kills, kills.c.steam_id == PlayerPresence.steam_id)
             .outerjoin(deaths, deaths.c.steam_id == PlayerPresence.steam_id)

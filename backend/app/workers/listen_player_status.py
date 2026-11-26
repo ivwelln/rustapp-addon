@@ -42,6 +42,7 @@ from app.crud.presence import (
     remove_offline_jobs,
     save_presence,
 )
+from app.crud.rustapp_requests import account_key
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer
 from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
@@ -398,6 +399,7 @@ async def run_listener() -> int:
         client = RustAppRealtimeClient(
             RUSTAPP_WS_URL,
             request_log=db_sessions,
+            account=account_key(settings.rustapp_access_token.get_secret_value()),
             events=ConnectionEvents(stopped),
             get_token=get_token,
             headers={"Origin": "https://rustapp.io"},

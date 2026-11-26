@@ -29,3 +29,9 @@ class RustAppResponseError(RustAppError):
 
 class PlayerNotOnline(RustAppError):
     """Персональный запрос отменён, пока не подтверждён статус online."""
+
+
+class ResearchDeferred(RustAppRequestNotSent):
+    def __init__(self, until: int, reason: str) -> None:
+        self.until = until
+        super().__init__(reason)

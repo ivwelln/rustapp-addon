@@ -12,8 +12,9 @@ from app.clients.rustapp.exceptions import (
     RustAppTimeoutError,
     RustAppTransportError,
 )
+from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import Settings
-from app.crud.rustapp_requests import record_request
+from app.crud.rustapp_requests import account_key, pause_account, record_request
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +35,32 @@ def create_rustapp_http_client(
     transport: httpx2.AsyncBaseTransport | None = None,
     base_url: httpx2.URL = RUSTAPP_BASE_URL,
     request_log: async_sessionmaker[AsyncSession] | None = None,
+    research: bool = False,
 ) -> httpx2.AsyncClient:
     if base_url not in (RUSTAPP_BASE_URL, RUSTAPP_CORE_URL):
         raise ValueError("Недопустимый адрес RustApp")
 
-    async def record(_request: httpx2.Request) -> None:
+    account = account_key(settings.rustapp_access_token.get_secret_value())
+    if research and request_log is None:
+        raise ValueError("Для исследовательских запросов требуется бюджет в PostgreSQL")
+
+    async def cooldown(response: httpx2.Response) -> None:
+        if response.status_code == 429:
+            seconds = parse_retry_after(response.headers.get("Retry-After"))
+            try:
+                await pause_account(request_log, account, 60 if seconds is None else seconds)
+            except (OSError, SQLAlchemyError) as exc:
+                logger.error("Не удалось сохранить общую паузу RustApp | %s", type(exc).__name__)
+
+    async def record(request: httpx2.Request) -> None:
+        if research and request.method != "GET":
+            raise RustAppRequestNotSent("Исследовательскому воркеру доступно только чтение")
         try:
-            await record_request(request_log)
+            await record_request(
+                request_log,
+                account,
+                research_project=settings.rustapp_project_id if research else None,
+            )
         except (SQLAlchemyError, OSError) as exc:
             raise RustAppRequestNotSent("Не удалось записать время запроса RustApp") from exc
 
@@ -56,7 +76,9 @@ def create_rustapp_http_client(
         follow_redirects=False,
         trust_env=False,
         transport=transport,
-        event_hooks={"request": [record]} if request_log is not None else None,
+        event_hooks={"request": [record], "response": [cooldown]}
+        if request_log is not None
+        else None,
     )
 
 

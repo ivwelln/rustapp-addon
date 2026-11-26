@@ -14,10 +14,12 @@ from app.crud.player_data import save_ip, save_reports
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
 from app.crud.presence import PRESENT, observe_server, presence_is_current
 from app.models import CollectionJob, CombatKill, PlayerData, PlayerPresence, ReferenceBan
+from app.services.moderation.eligibility import cached_project_ms
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
 from app.services.moderation.kill_feed import PAGE_LIMIT, update_coverage
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
+from app.services.research.playtime import DAY, HOUR, cache_days, daily_playtime, missing_range
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +92,10 @@ async def collect(
     previous = job.collected_at
     fresh = previous is None or job.requested_at > previous or active_since > previous
     history = await known_sessions(db, project, sid, presence, now)
-    if played_ms(history, settings.server_id, now) > WHITELIST_PLAYTIME_MS:
+    if (
+        played_ms(history, server_id=None, now=now) >= WHITELIST_PLAYTIME_MS
+        or await cached_project_ms(db, project, sid, now) >= WHITELIST_PLAYTIME_MS
+    ):
         await whitelist_for_playtime(db, project, sid)
         logger.info("Белый список: подтверждено игровое время | SteamID=%s", sid)
         job.collected_at, job.due_at = now, None
@@ -123,6 +128,15 @@ async def collect(
     ):
         if (not fresh and source != "reports") or not needs_refresh(source):
             continue
+        if source == "stats":
+            previous_stats = cached.get("stats", {})
+            if previous_stats.get(
+                "observed_at", 0
+            ) >= now // DAY * DAY and "playTime" in previous_stats.get("payload", {}):
+                continue
+            gap = await missing_range(db, project, sid, now)
+            if gap and gap["time_to"] - gap["time_from"] > 30 * DAY:
+                params = {"time_from": gap["time_from"], "time_to": now}
         try:
             payload = await read(client, base + source, **params)
         except RustAppHTTPError as exc:
@@ -145,7 +159,31 @@ async def collect(
                     and address.get("steam_id", sid) == sid
                 ],
             }
-        await archive(db, project, sid, source, payload)
+        await archive(db, project, sid, source, payload, params=params)
+        if source == "stats":
+            try:
+                observed = now_ms()
+                await cache_days(db, project, sid, payload, params, observed)
+                current_days = daily_playtime(payload, sid)
+                confirmed = sum(
+                    duration
+                    for day, duration in current_days.items()
+                    if observed - 365 * DAY <= day <= observed
+                )
+                if (
+                    max(confirmed, await cached_project_ms(db, project, sid, observed))
+                    >= WHITELIST_PLAYTIME_MS
+                ):
+                    await whitelist_for_playtime(db, project, sid)
+                    job.collected_at, job.due_at = observed, None
+                    logger.info(
+                        "Белый список по часам RustApp | SteamID=%s часы от %.2f",
+                        sid,
+                        confirmed / HOUR,
+                    )
+                    return
+            except RustAppResponseError:
+                logger.debug("Статистика без подтверждённых дневных часов | SteamID=%s", sid)
         if source == "reports":
             await save_reports(db, project, sid, results(payload))
         if source == "ip-history":
@@ -167,7 +205,19 @@ async def collect(
         time_from=feed_start,
         time_to=now,
     )
-    await archive(db, project, sid, "kill-feed", data)
+    await archive(
+        db,
+        project,
+        sid,
+        "kill-feed",
+        data,
+        params={
+            "page": 0,
+            "limit": PAGE_LIMIT,
+            "time_from": feed_start,
+            "time_to": now,
+        },
+    )
     rows = results(data)
     update_coverage(job, data, rows, start=feed_start, end=now)
     for row in rows:
