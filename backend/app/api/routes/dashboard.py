@@ -1,13 +1,19 @@
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ban_guard.quota import BAN_LIMIT, slots_used
 from app.models import CollectionJob, Decision, Player, PlayerPresence, RustAppRequest
+from app.services.dashboard.roster import online_players
 from app.services.moderation.evaluate import describe
 
 ASSETS = Path(__file__).resolve().parents[2] / "static" / "dashboard"
@@ -55,6 +61,39 @@ def reason(decision: Decision) -> str:
 @router.get("/api/dashboard", include_in_schema=False)
 async def dashboard(request: Request, response: Response) -> dict:
     response.headers.update(HEADERS)
+    return await read_snapshot(request)
+
+
+@router.get("/api/dashboard/events", include_in_schema=False)
+async def dashboard_events(request: Request) -> StreamingResponse:
+    if request.app.state.dashboard_sessions is None:
+        raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
+    return StreamingResponse(
+        stream_snapshots(request),
+        media_type="text/event-stream",
+        headers={**HEADERS, "X-Accel-Buffering": "no"},
+    )
+
+
+async def stream_snapshots(request: Request) -> AsyncIterator[str]:
+    updates = request.app.state.dashboard_updates
+    while True:
+        changed = updates.changed
+        try:
+            data = await read_snapshot(request)
+        except HTTPException as exc:
+            yield f"event: unavailable\ndata: {json.dumps(str(exc.detail), ensure_ascii=False)}\n\n"
+        else:
+            serialized = json.dumps(
+                jsonable_encoder(data), ensure_ascii=False, separators=(",", ":")
+            )
+            yield f"event: snapshot\ndata: {serialized}\n\n"
+        with suppress(TimeoutError):
+            await asyncio.wait_for(changed.wait(), timeout=15)
+            await asyncio.sleep(0.3)
+
+
+async def read_snapshot(request: Request) -> dict:
     sessions = request.app.state.dashboard_sessions
     if sessions is None:
         raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
@@ -69,7 +108,7 @@ async def dashboard(request: Request, response: Response) -> dict:
             CollectionJob.steam_id,
             CollectionJob.collected_at,
             CollectionJob.due_at,
-            PlayerPresence.is_afk,
+            PlayerPresence.status,
             Player.is_whitelisted,
         )
         .outerjoin(
@@ -86,7 +125,7 @@ async def dashboard(request: Request, response: Response) -> dict:
         .subquery()
     )
     scheduled = jobs.c.due_at.is_not(None) & jobs.c.is_whitelisted.is_not(True)
-    waiting = scheduled & jobs.c.is_afk.is_not(True)
+    waiting = scheduled & (jobs.c.status == "online")
     bucket = func.date_trunc("minute", RustAppRequest.requested_at)
     try:
         async with sessions() as db:
@@ -95,7 +134,7 @@ async def dashboard(request: Request, response: Response) -> dict:
                     select(
                         func.count().filter(waiting),
                         func.count().filter(waiting & (jobs.c.due_at <= now_ms)),
-                        func.count().filter(scheduled & jobs.c.is_afk.is_(True)),
+                        func.count().filter(scheduled & (jobs.c.status == "afk")),
                     ).select_from(jobs)
                 )
             ).one()
@@ -125,19 +164,7 @@ async def dashboard(request: Request, response: Response) -> dict:
                     RustAppRequest.requested_at >= now - timedelta(hours=1),
                 )
             )
-            activity = (
-                await db.execute(
-                    select(jobs)
-                    .where(scheduled | jobs.c.collected_at.is_not(None))
-                    .order_by(
-                        scheduled.desc(),
-                        jobs.c.due_at.asc().nulls_last(),
-                        jobs.c.collected_at.desc().nulls_last(),
-                        jobs.c.steam_id,
-                    )
-                    .limit(200)
-                )
-            ).all()
+            roster = await online_players(db, project, now_ms)
             decisions = (
                 await db.scalars(
                     select(Decision)
@@ -166,23 +193,7 @@ async def dashboard(request: Request, response: Response) -> dict:
             timeline.get(first_minute + timedelta(minutes=index), 0) for index in range(60)
         ],
         "guard": {"used": used, "limit": BAN_LIMIT},
-        "players": [
-            {
-                "steam_id": player.steam_id,
-                "collected_at": player.collected_at,
-                "due_at": player.due_at,
-                "status": (
-                    "trusted"
-                    if player.is_whitelisted
-                    else "afk"
-                    if player.is_afk and player.due_at is not None
-                    else "waiting"
-                    if player.due_at is not None
-                    else "stopped"
-                ),
-            }
-            for player in activity
-        ],
+        "players": roster,
         "decisions": [
             {
                 "id": decision.id,

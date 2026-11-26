@@ -9,18 +9,17 @@ from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import RustAppHTTPError, RustAppResponseError
 from app.clients.rustapp.moderation import Profile, parse_kill, read, results
 from app.core.config import ModerationSettings
-from app.crud.moderation import archive, latest, now_ms, reference_bans, save_decision, save_kill
-from app.crud.player_data import save_ip, save_reports, save_sessions, stored_sessions
+from app.crud.moderation import archive, now_ms, reference_bans, save_decision, save_kill
+from app.crud.player_data import save_ip, save_reports
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
-from app.crud.presence import is_afk
-from app.models import CollectionJob, CombatKill, PlayerData
+from app.crud.presence import PRESENT, observe_server
+from app.models import CollectionJob, CombatKill, PlayerData, PlayerPresence
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, YEAR_MS, played_ms
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
 
 logger = logging.getLogger(__name__)
 
-SESSION_PAGE_SIZE = 20
 JOIN_DATA_TTL = 10 * MINUTE
 
 
@@ -30,16 +29,6 @@ async def fetch_profile(client: RustAppClient, project: int, sid: str) -> tuple[
     if profile.project_id != project or profile.steam_id != sid:
         raise RustAppResponseError("Получен профиль другого игрока или проекта")
     return profile, data
-
-
-async def fetch_sessions(
-    client: RustAppClient, project: int, sid: str, *, page: int = 0
-) -> tuple[list[Session], dict]:
-    data = await read(client, f"/players/{sid}/session-history", page=page, limit=SESSION_PAGE_SIZE)
-    records = [Session.model_validate(session) for session in results(data, page=page)]
-    if any(session.steam_id != sid or session.project_id != project for session in records):
-        raise RustAppResponseError("Получены чужие сессии")
-    return sorted(records, key=lambda session: session.connected_at), data
 
 
 async def cache_profile(db: AsyncSession, project: int, sid: str, data: dict) -> bool:
@@ -61,108 +50,34 @@ async def cache_profile(db: AsyncSession, project: int, sid: str, data: dict) ->
     return True
 
 
-async def cache_sessions(
-    db: AsyncSession, project: int, sid: str, data: dict, *, page: int = 0
-) -> bool:
-    await archive(
-        db, project, sid, "session-history" if page == 0 else f"session-history:{page}", data
-    )
-    rows = results(data, page=page)
-    await save_sessions(db, rows)
-    now = now_ms()
-    latest_license_at = max(
-        (
-            row["connected_at"]
-            for row in rows
-            if row.get("is_license") is True and row["connected_at"] <= now
-        ),
-        default=None,
-    )
-    if latest_license_at is None:
-        return False
-    await upsert_player_client_kinds(
-        db,
-        project_id=project,
-        client_kinds={sid: "licensed"},
-        observed_at=datetime.fromtimestamp(latest_license_at / 1000, UTC),
-    )
-    return True
-
-
-async def collect_playtime(
-    db: AsyncSession,
-    client: RustAppClient,
-    job: CollectionJob,
-    server: int,
-    records: list[Session],
-    *,
-    fresh: bool,
-    now: int,
-) -> bool:
-    project, sid = job.project_id, job.steam_id
-    newest = records[-1].connected_at if records else now
-    by_connection = {
-        (session.server_id, session.connected_at): session
-        for session in await stored_sessions(db, project, sid)
-    }
-    page = 0
-    while played_ms(by_connection.values(), server, now) <= WHITELIST_PLAYTIME_MS:
-        covered_at = job.session_history_covered_at
-        if (
-            len(records) < SESSION_PAGE_SIZE
-            or records[0].connected_at <= now - YEAR_MS
-            or (covered_at is not None and records[0].connected_at <= covered_at)
-        ):
-            job.session_history_covered_at = newest
-            return False
-        if not fresh:
-            return False
-        oldest_on_previous_page = records[0].connected_at
-        page += 1
-        records, data = await fetch_sessions(client, project, sid, page=page)
-        if records and records[0].connected_at >= oldest_on_previous_page:
-            return False
-        if await cache_sessions(db, project, sid, data, page=page):
-            return True
-        by_connection.update(
-            {(session.server_id, session.connected_at): session for session in records}
-        )
-    return True
-
-
 async def collect(
     db: AsyncSession, client: RustAppClient, job: CollectionJob, settings: ModerationSettings
 ) -> None:
     project, sid = job.project_id, job.steam_id
-    if await is_afk(db, project, sid):
-        return
     if await whitelisted(db, project, sid, lock=True):
         job.due_at = None
         logger.debug("Модерация: пропуск по белому списку | SteamID=%s", sid)
         return
-    fresh = job.collected_at is None or job.requested_at > job.collected_at
-    records, session_data = await fetch_sessions(client, project, sid)
-    last_history = await latest(db, project, sid, "session-history")
-    if records and last_history is not None:
-        known_connections = {session["connected_at"] for session in results(last_history.payload)}
-        fresh = fresh or records[-1].connected_at not in known_connections
-    is_licensed = await cache_sessions(db, project, sid, session_data)
+
     now = now_ms()
-    if is_licensed:
-        logger.info("Белый список: добавлен игрок по лицензии | SteamID=%s", sid)
-        job.collected_at, job.due_at = now, None
+    presence = await db.get(PlayerPresence, (project, sid))
+    if presence is None or presence.active_since is None:
+        awaiting_entry = presence is None or presence.status in ("joining", None)
+        job.due_at = (
+            now + settings.poll_seconds * 1000
+            if awaiting_entry and now - job.requested_at < 5 * MINUTE
+            else None
+        )
         return
-    if await collect_playtime(
-        db,
-        client,
-        job,
-        settings.server_id,
-        records,
-        fresh=fresh,
-        now=now,
-    ):
+    if presence.status != "online":
+        return
+    active_since = presence.active_since
+    previous = job.collected_at
+    fresh = previous is None or job.requested_at > previous or active_since > previous
+    history = await known_sessions(db, project, sid, presence, now)
+    if played_ms(history, settings.server_id, now) > WHITELIST_PLAYTIME_MS:
         await whitelist_for_playtime(db, project, sid)
-        logger.info("Белый список: подтверждены лицензия или игровое время | SteamID=%s", sid)
+        logger.info("Белый список: подтверждено игровое время | SteamID=%s", sid)
         job.collected_at, job.due_at = now, None
         return
     player_data = await db.get(PlayerData, (project, sid))
@@ -172,37 +87,26 @@ async def collect(
         return now - cached.get(source, {}).get("observed_at", 0) >= JOIN_DATA_TTL
 
     last_profile = cached.get("details", {}).get("payload")
-    if last_profile is None or (fresh and needs_refresh("details")):
+    observed_profile_at: int | None = None
+    if last_profile is None or (fresh and needs_refresh("details")) or presence.server_id is None:
+        observed_profile_at = now_ms()
         profile, data = await fetch_profile(client, project, sid)
         if await cache_profile(db, project, sid, data):
-            logger.info("Белый список: добавлен игрок по лицензии из профиля | SteamID=%s", sid)
             job.collected_at, job.due_at = now, None
+            logger.info("Белый список: добавлен игрок по лицензии из профиля | SteamID=%s", sid)
             return
     else:
         profile = Profile.model_validate(last_profile["player"])
         logger.debug("PostgreSQL: профиль использован из кэша | SteamID=%s", sid)
     now = now_ms()
     base = f"/players/{sid}/"
-    eligible = [
-        session
-        for session in records
-        if session.server_id == settings.server_id and session.connected_at <= now
-    ]
-    current = eligible[-1] if eligible else None
-    active = current is not None and current.disconnected_at is None
-    # RustApp may publish the confirmed entry before the HTTP session appears.
-    awaiting_session = now - job.requested_at < 5 * MINUTE and (
-        current is None
-        or (active and current.joined_at is None)
-        or (not active and current.disconnected_at < job.requested_at)
-    )
     for source, params in (
         ("stats", {"time_from": now - 30 * 1440 * MINUTE, "time_to": now}),
         ("checks", {"page": 0, "limit": 1}),
         ("reports", {"page": 0, "limit": 20, "variant": "received"}),
         ("ip-history", {"page": 0, "limit": 20}),
     ):
-        if (not fresh and (source != "reports" or not active)) or not needs_refresh(source):
+        if (not fresh and source != "reports") or not needs_refresh(source):
             continue
         try:
             payload = await read(client, base + source, **params)
@@ -239,15 +143,6 @@ async def collect(
                     address.get("last_seen_at") or address.get("created_at") or now,
                     address,
                 )
-    if (
-        not fresh
-        and not active
-        and last_history is not None
-        and session_data == last_history.payload
-    ):
-        job.collected_at = now
-        job.due_at = now + settings.poll_seconds * 1000 if awaiting_session else None
-        return
     data = await read(
         client,
         base + "kill-feed",
@@ -263,36 +158,36 @@ async def collect(
         if (kill := parse_kill(row, sid)) is not None:
             await save_kill(db, project, row["server_id"], sid, kill, row)
 
-    previous = job.collected_at
     job.collected_at = now
-    job.due_at = (
-        now + settings.poll_seconds * 1000
-        if (active and current.joined_at is not None) or awaiting_session
-        else None
+    job.due_at = now + settings.poll_seconds * 1000
+    presence = await db.get(
+        PlayerPresence, (project, sid), populate_existing=True, with_for_update=True
     )
-    if not current:
-        logger.debug("Модерация: сессия на сервере наблюдения не найдена | SteamID=%s", sid)
+    if presence is None or presence.active_since != active_since or presence.status != "online":
         return
-    kind = {True: "licensed", False: "pirated", None: "unknown"}[current.is_license]
-
-    await upsert_player_client_kinds(
-        db,
+    if observed_profile_at is not None:
+        if profile.status not in PRESENT:
+            return
+        if profile.server_id is not None:
+            observe_server(
+                db, presence, profile.server_id, profile.last_no_license, observed_profile_at
+            )
+    if (
+        presence.active_since != active_since
+        or presence.server_id != settings.server_id
+        or presence.is_pirated is not True
+    ):
+        return
+    current = Session(
         project_id=project,
-        client_kinds={sid: kind},
-        observed_at=datetime.fromtimestamp(current.connected_at / 1000, UTC),
+        steam_id=sid,
+        server_id=settings.server_id,
+        connected_at=presence.session_key,
+        joined_at=presence.joined_at or active_since,
+        is_license=False,
     )
-    if current.is_license is not False or current.joined_at is None:
-        logger.debug(
-            "Модерация: пропуск без подтверждённой пиратской игровой сессии | SteamID=%s клиент=%s",
-            sid,
-            kind,
-        )
-        return
-    # A delayed final poll may still archive the evidence, but never dispatch for a closed session.
-    if not active and (current.disconnected_at or 0) < job.requested_at:
-        return
-    start = current.joined_at
-    end = min(current.disconnected_at or now, now)
+    start = active_since
+    end = now
     rules = settings.patterns
     span = (
         max(
@@ -304,8 +199,7 @@ async def collect(
         )
         * MINUTE
     )
-    lower = min(start, previous or job.requested_at) - span
-    lower = max(lower, (previous or job.requested_at) - 2 * span)
+    lower = max(start, (previous or job.requested_at) - span)
     stored = await db.scalars(
         select(CombatKill)
         .where(
@@ -317,22 +211,24 @@ async def collect(
         .order_by(CombatKill.at, CombatKill.event_id)
     )
     kills = tuple(Kill.model_validate(record.facts) for record in stored)
-    first = next((session for session in eligible if session.joined_at is not None), None)
-    # A full page can hide earlier sessions unless it reaches the creation of the project profile.
-    complete_start = len(records) < 20 or records[0].connected_at <= profile.created_at
-    first_join = first == current and complete_start
-    new_on_project = 0 <= start - profile.created_at <= 60 * MINUTE
+    first_join = (
+        presence.joined_at is not None
+        and presence.first_active_at == active_since
+        and 0 <= presence.joined_at - profile.created_at <= 60 * MINUTE
+        and not any(session.connected_at < active_since for session in history)
+    )
     references = await reference_bans(db, project, profile.signed_at, current, rules)
     facts = Facts(
         sid,
         current,
         profile.created_at,
-        first_join and new_on_project,
+        first_join,
         profile.signed_at,
         profile.private_without_date,
         start,
         kills,
         references,
+        connection_observed=presence.connecting_at is not None,
     )
     matches = evaluate(facts, rules, entry=True) if first_join else {}
     # Revisit the recent window after reconnects or late publication of a hit log.
@@ -349,4 +245,4 @@ async def collect(
         len(kills),
         ", ".join(sorted(matches)) or "нет",
     )
-    await save_decision(db, current, matches, enforce=settings.enforce and active)
+    await save_decision(db, current, matches, enforce=settings.enforce)

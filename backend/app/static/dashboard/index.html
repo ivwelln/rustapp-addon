@@ -4,29 +4,74 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Мониторинг RustApp</title>
+  <title>RustApp · Мониторинг</title>
   <link rel="stylesheet" href="/dashboard-assets/dashboard.css">
   <script src="/dashboard-assets/dashboard.js" defer></script>
 </head>
 <body>
   <header class="topbar">
     <div class="shell bar-content">
-      <a href="/" class="brand"><span class="brand-icon" aria-hidden="true">R</span> RustApp<span class="addon"> / Мониторинг</span></a>
-      <div class="connection" id="connection" data-state="wait" role="status"><span></span><span id="connection-label">Подключение</span></div>
+      <a href="/" class="brand">
+        <span class="brand-icon" aria-hidden="true">R</span>
+        <span>RustApp <small>Мониторинг</small></span>
+      </a>
+      <div class="connection" id="connection" data-state="wait" role="status">
+        <span class="connection-dot"></span><span id="connection-label">Подключение</span>
+      </div>
     </div>
   </header>
   <main class="shell">
     <div class="intro">
-      <div><h1>Модерация</h1><p id="project-meta">Очередь проверок и обращения к RustApp</p></div>
+      <div><p class="project" id="project-meta">RustApp</p><h1>Игроки и модерация</h1></div>
       <button id="refresh" class="refresh" type="button"><span aria-hidden="true">↻</span> Обновить</button>
     </div>
     <p id="error" class="notice" role="status" hidden></p>
+
     <section class="metrics" aria-label="Сводка">
-      <article class="panel metric"><h2>В очереди</h2><strong id="queue">—</strong><p id="ready">Готовы к проверке: —</p></article>
-      <article class="panel metric"><h2>Пауза AFK</h2><strong id="afk">—</strong><p>Персональный опрос на паузе</p></article>
-      <article class="panel metric"><h2>Белый список</h2><strong id="trusted">—</strong><p>Аккаунты с исключением</p></article>
-      <article class="panel metric"><h2>Лимит автобанов</h2><strong id="guard">—</strong><p id="guard-status">Занято мест</p></article>
+      <article class="panel metric">
+        <h2><span class="metric-dot green"></span>На серверах</h2><strong id="online-total">—</strong>
+        <p id="online-detail">Онлайн и AFK</p>
+      </article>
+      <article class="panel metric">
+        <h2><span class="metric-dot blue"></span>Очередь проверок</h2><strong id="queue">—</strong>
+        <p id="ready">Готовы к проверке: —</p>
+      </article>
+      <article class="panel metric">
+        <h2><span class="metric-dot muted"></span>Белый список</h2><strong id="trusted">—</strong>
+        <p id="trusted-detail">Аккаунтов на проекте</p>
+      </article>
+      <article class="panel metric">
+        <h2><span class="metric-dot warm"></span>Лимит автобанов</h2><strong id="guard">—</strong>
+        <p id="guard-status">Занято мест</p>
+      </article>
     </section>
+
+    <section class="panel activity" aria-labelledby="activity-title">
+      <div class="panel-head">
+        <div><h2 id="activity-title">Игроки на серверах</h2><p id="updated">Ожидаем данные</p></div>
+        <div class="switch" role="group" aria-label="Раздел">
+          <button type="button" data-tab="players" aria-pressed="true">Игроки</button>
+          <button type="button" data-tab="decisions" aria-pressed="false">Решения</button>
+        </div>
+      </div>
+      <div class="table-tools">
+        <div class="filters" id="filters" role="group" aria-label="Статус игрока">
+          <button type="button" data-status="all" aria-pressed="true">Все</button>
+          <button type="button" data-status="online" aria-pressed="false">Онлайн</button>
+          <button type="button" data-status="afk" aria-pressed="false">AFK</button>
+        </div>
+        <input id="search" type="search" placeholder="Имя или SteamID" aria-label="Поиск игроков">
+      </div>
+      <div class="table-scroll">
+        <table><thead id="columns"></thead><tbody id="rows"></tbody></table>
+      </div>
+      <p id="empty" class="table-empty">Загружаем данные…</p>
+      <div class="table-footer" id="roster-footer" hidden>
+        <span id="visible-count"></span>
+        <span>Убийства за 24 ч по собранным килллогам</span>
+      </div>
+    </section>
+
     <section class="panel traffic" aria-labelledby="traffic-title">
       <div class="panel-head">
         <div><h2 id="traffic-title">Запросы к RustApp</h2><p>Попытки обращений по минутам</p></div>
@@ -37,20 +82,6 @@
         <p id="chart-empty" hidden>За последний час запросов не было</p>
       </div>
       <div class="axis" aria-hidden="true"><span>−60 мин</span><span>−30 мин</span><span>Сейчас</span></div>
-    </section>
-    <section class="panel activity" aria-labelledby="activity-title">
-      <div class="panel-head">
-        <div><h2 id="activity-title">Активность</h2><p id="updated">Ожидаем данные</p></div>
-        <div class="switch" role="group" aria-label="Выбор журнала">
-          <button type="button" data-tab="players" aria-pressed="true">Игроки</button>
-          <button type="button" data-tab="decisions" aria-pressed="false">Решения</button>
-        </div>
-      </div>
-      <div class="table-tools"><input id="search" type="search" placeholder="Поиск по SteamID" aria-label="Поиск по SteamID"></div>
-      <div class="table-scroll">
-        <table><thead id="columns"></thead><tbody id="rows"></tbody></table>
-      </div>
-      <p id="empty" class="table-empty">Загружаем активность…</p>
     </section>
   </main>
 </body>

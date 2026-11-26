@@ -133,6 +133,7 @@ class Facts:
     at: int
     kills: tuple[Kill, ...]
     bans: tuple[Ban, ...]
+    connection_observed: bool = True
 
 
 def recent_kills(facts: Facts, minutes: int) -> list[Kill]:

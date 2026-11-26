@@ -7,14 +7,14 @@ from sqlalchemy import select
 
 from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
-from app.clients.rustapp.exceptions import PlayerAfk, RustAppError, RustAppHTTPError
+from app.clients.rustapp.exceptions import PlayerNotOnline, RustAppError, RustAppHTTPError
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, ModerationSettings, get_settings
 from app.core.logging import configure_console_logging
 from app.crud.moderation import now_ms
-from app.crud.presence import is_afk, player_is_afk
+from app.crud.presence import player_is_online
 from app.db.session import open_database_sessions
-from app.models import CollectionJob
+from app.models import CollectionJob, PlayerPresence
 from app.services.moderation.bans import deliver, reconcile, sync_bans
 from app.services.moderation.collect import collect
 
@@ -50,7 +50,7 @@ async def run() -> None:
             await asyncio.sleep(max(0, next_request - loop.time()))
             next_request = loop.time() + settings.request_interval
 
-        async def skip_afk_request(request: httpx2.Request) -> None:
+        async def skip_inactive_request(request: httpx2.Request) -> None:
             parts = request.url.path.strip("/").split("/")
             steam_id = parts[1] if len(parts) == 3 and parts[0] == "players" else None
             if request.url.path == "/ban/browse":
@@ -58,11 +58,12 @@ async def run() -> None:
             if steam_id is None:
                 return
             async with sessions() as db:
-                if await is_afk(db, project, steam_id):
-                    logger.debug("RustApp: запрос отложен на время AFK | SteamID=%s", steam_id)
-                    raise PlayerAfk
+                presence = await db.get(PlayerPresence, (project, steam_id))
+                if presence is None or presence.status != "online":
+                    logger.debug("RustApp: персональный запрос пропущен | SteamID=%s", steam_id)
+                    raise PlayerNotOnline
 
-        http.event_hooks["request"][:0] = [pace, skip_afk_request]
+        http.event_hooks["request"][:0] = [pace, skip_inactive_request]
         sync_due = 0.0
         while True:
             delay = 0
@@ -84,7 +85,7 @@ async def run() -> None:
                         .where(
                             CollectionJob.project_id == project,
                             CollectionJob.due_at <= now_ms(),
-                            ~player_is_afk(CollectionJob.project_id, CollectionJob.steam_id),
+                            player_is_online(CollectionJob.project_id, CollectionJob.steam_id),
                         )
                         .order_by(CollectionJob.due_at)
                         .limit(1)
@@ -99,7 +100,7 @@ async def run() -> None:
                         )
                         try:
                             await collect(db, client, job, settings)
-                        except PlayerAfk:
+                        except PlayerNotOnline:
                             logger.debug("Модерация: сбор приостановлен | SteamID=%s", job.steam_id)
                         else:
                             next_check = job.due_at
@@ -115,8 +116,8 @@ async def run() -> None:
                         else "снята с расписания",
                     )
                 await deliver(sessions, client, project, settings, guard)
-            except PlayerAfk:
-                logger.debug("Модерация: отправка отложена на время AFK")
+            except PlayerNotOnline:
+                logger.debug("Модерация: отправка отложена до подтверждения онлайна")
             except RustAppHTTPError as exc:
                 if exc.status_code in (401, 403):
                     raise
@@ -131,10 +132,11 @@ async def run() -> None:
                     type(exc).__name__,
                 )
                 delay = 5
-            if job_key and delay >= 5:
+            if job_key and not finished and delay >= 5:
                 async with sessions.begin() as db:
                     job = await db.get(CollectionJob, job_key, with_for_update=True)
-                    job.due_at = now_ms() + int(delay * 1000)
+                    if job is not None and job.due_at is not None:
+                        job.due_at = now_ms() + int(delay * 1000)
             await asyncio.sleep(delay)
 
 

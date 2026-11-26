@@ -9,6 +9,7 @@ class RustAppPlayer(BaseModel):
     steam_id: str = Field(min_length=1)
     project_id: int = Field(gt=0)
     status: str | None = None
+    server_id: int | None = None
 
     last_no_license: bool | None = None
 

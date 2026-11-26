@@ -10,6 +10,10 @@ class Profile(BaseModel):
     steam_id: str
     project_id: int
     created_at: int = Field(gt=0)
+    server_id: int | None = None
+    status: str | None = None
+    last_no_license: bool | None = None
+    ip: str | None = Field(default=None, repr=False)
     steam: dict | None = None
     steam_data: dict | None = None
 

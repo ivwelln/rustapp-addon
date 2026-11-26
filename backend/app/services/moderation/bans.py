@@ -1,6 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from ipaddress import ip_address
+from time import time_ns
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -10,7 +11,7 @@ from sqlalchemy.orm import aliased
 from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import (
-    PlayerAfk,
+    PlayerNotOnline,
     RustAppHTTPError,
     RustAppResponseError,
     RustAppTransportError,
@@ -18,19 +19,16 @@ from app.clients.rustapp.exceptions import (
 from app.clients.rustapp.moderation import Profile, is_player, read, results
 from app.core.config import ModerationSettings
 from app.crud.moderation import archive, latest, now_ms
-from app.crud.player_data import stored_sessions
 from app.crud.players import whitelist_for_playtime, whitelisted
-from app.crud.presence import is_afk, player_is_afk
-from app.models import Decision, ReferenceBan
+from app.crud.presence import player_is_afk, save_presence
+from app.models import Decision, PlayerPresence, ReferenceBan
 from app.services.moderation.collect import (
     cache_profile,
-    cache_sessions,
     fetch_profile,
-    fetch_sessions,
 )
 from app.services.moderation.evaluate import PRIORITY, describe
 from app.services.moderation.facts import MINUTE
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, played_ms
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, known_sessions, played_ms
 
 logger = logging.getLogger(__name__)
 
@@ -96,28 +94,22 @@ async def sync_bans(
             pirate = False
             if eligible:
                 sid = ban["steam_id"]
-                sessions = await stored_sessions(db, project, sid)
+                presence = await db.get(PlayerPresence, (project, sid))
+                sessions = await known_sessions(db, project, sid, presence, until)
                 cached_profile = await latest(db, project, sid, "details")
                 if cached_profile is not None:
                     signed_at = Profile.model_validate(cached_profile.payload["player"]).signed_at
                 try:
                     if (
                         signed_at is None
-                        and not await is_afk(db, project, sid)
+                        and presence is not None
+                        and presence.status == "online"
                         and not await whitelisted(db, project, sid)
                     ):
                         profile, details = await fetch_profile(client, project, sid)
                         signed_at = profile.signed_at
                         await cache_profile(db, project, sid, details)
-                    cached_history = await latest(db, project, sid, "session-history")
-                    if (
-                        (cached_history is None or cached_history.observed_at < ban["created_at"])
-                        and not await is_afk(db, project, sid)
-                        and not await whitelisted(db, project, sid)
-                    ):
-                        sessions, history = await fetch_sessions(client, project, sid)
-                        await cache_sessions(db, project, sid, history)
-                except PlayerAfk:
+                except PlayerNotOnline:
                     pass
                 except RustAppHTTPError as exc:
                     if exc.status_code not in (404, 422):
@@ -264,26 +256,31 @@ async def deliver(
         if await whitelisted(db, project, sid, lock=True):
             row.state = "cancelled"
             return
-        history, history_data = await fetch_sessions(client, project, sid)
-        if await cache_sessions(db, project, sid, history_data):
+        current = await db.get(PlayerPresence, (project, sid))
+        if current is None or current.status != "online" or current.session_key != row.connected_at:
             row.state = "cancelled"
             return
-        current = next(
-            (session for session in reversed(history) if session.server_id == row.server_id), None
-        )
+        now = now_ms()
         if (
-            not current
-            or current.is_license is not False
-            or current.disconnected_at is not None
-            or current.connected_at != row.connected_at
-        ):
-            row.state = "cancelled"
-            return
-        if (
-            played_ms(await stored_sessions(db, project, sid), settings.server_id, now_ms())
+            played_ms(await known_sessions(db, project, sid, current, now), settings.server_id, now)
             > WHITELIST_PLAYTIME_MS
         ):
             await whitelist_for_playtime(db, project, sid)
+            row.state = "cancelled"
+            return
+        profile_observed_at = time_ns()
+        profile, details = await fetch_profile(client, project, sid)
+        if (
+            await cache_profile(db, project, sid, details)
+            or profile.last_no_license is not True
+            or profile.server_id != row.server_id
+        ):
+            row.state = "cancelled"
+            return
+        if profile.status == "afk":
+            await save_presence(db, project, {sid: "afk"}, profile_observed_at)
+            return
+        if profile.status != "online":
             row.state = "cancelled"
             return
         allowed = {
@@ -309,7 +306,10 @@ async def deliver(
         row.primary_pattern = pattern
         marker = f"{MARKER}{key}:{pattern}"
         reason = describe(pattern, allowed[pattern])
-        target_ip = current.ban_ip
+        try:
+            target_ip = str(ip_address(profile.ip))
+        except ValueError:
+            target_ip = None
         if target_ip is None:
             row.state = "failed"
             logger.error(
@@ -358,7 +358,11 @@ async def deliver(
             if trusted:
                 claimed.state = "cancelled"
                 return
-            if await is_afk(db, project, sid):
+            presence = await db.get(PlayerPresence, (project, sid))
+            if presence is None or presence.session_key != claimed.connected_at:
+                claimed.state = "cancelled"
+                return
+            if presence.status != "online":
                 claimed.state = "pending"
                 return
             logger.info(
@@ -371,7 +375,7 @@ async def deliver(
                 reason,
             )
             await client.put_player_ban(sid, {"bans": [body], "override_broadcast": False})
-    except PlayerAfk:
+    except PlayerNotOnline:
         async with sessions.begin() as db:
             claimed = await db.get(Decision, key, with_for_update=True)
             if claimed.state == "sending":
@@ -406,7 +410,12 @@ async def deliver(
 async def reconciliation_bans(
     db: AsyncSession, client: RustAppClient, project: int, steam_id: str
 ) -> AsyncIterator[dict]:
-    if await is_afk(db, project, steam_id) or await whitelisted(db, project, steam_id, lock=True):
+    presence = await db.get(PlayerPresence, (project, steam_id))
+    if (
+        presence is None
+        or presence.status != "online"
+        or await whitelisted(db, project, steam_id, lock=True)
+    ):
         cached_bans = await db.scalars(
             select(ReferenceBan.payload).where(
                 ReferenceBan.project_id == project,
@@ -419,7 +428,7 @@ async def reconciliation_bans(
         try:
             async for ban in player_bans(db, client, project, steam_id):
                 yield ban
-        except PlayerAfk:
+        except PlayerNotOnline:
             return
 
 

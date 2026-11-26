@@ -61,31 +61,6 @@ async def save_ip(
     )
 
 
-async def save_sessions(db: AsyncSession, records: list[dict]) -> None:
-    for raw in records:
-        statement = insert(PlayerSession).values(
-            project_id=raw["project_id"],
-            steam_id=raw["steam_id"],
-            server_id=raw["server_id"],
-            connected_at=raw["connected_at"],
-            payload=raw,
-        )
-        await db.execute(
-            statement.on_conflict_do_update(
-                index_elements=list(PlayerSession.__table__.primary_key.columns),
-                set_={"payload": statement.excluded.payload},
-            )
-        )
-        await save_ip(
-            db,
-            raw["project_id"],
-            raw["steam_id"],
-            raw.get("ip"),
-            raw["connected_at"],
-            raw.get("ip_details") or {},
-        )
-
-
 async def stored_sessions(db: AsyncSession, project: int, steam_id: str) -> list[Session]:
     payloads = await db.scalars(
         select(PlayerSession.payload)

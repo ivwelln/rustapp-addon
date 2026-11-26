@@ -23,5 +23,5 @@ class RustAppResponseError(RustAppError):
     """RustApp вернул ответ неожиданного формата."""
 
 
-class PlayerAfk(RustAppError):
-    """Персональный запрос отменён, пока игрок находится в AFK."""
+class PlayerNotOnline(RustAppError):
+    """Персональный запрос отменён, пока не подтверждён статус online."""

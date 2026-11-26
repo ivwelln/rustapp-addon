@@ -11,8 +11,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.core.config import ModerationSettings, Settings
 from app.crud.moderation import enqueue, now_ms
-from app.crud.presence import is_afk, player_is_afk
-from app.models import CollectionJob
+from app.crud.presence import is_afk, player_is_afk, player_is_online
+from app.models import CollectionJob, ObservedPlay, PlayerPresence
 from app.services.moderation.collect import collect
 from app.services.rustapp.player_sessions import PlayerSessionTracker
 from app.workers.listen_player_status import PlayerStatusEvents
@@ -85,5 +85,28 @@ async def test_afk_pauses_requests_and_online_wakes_existing_job():
                 assert job.due_at <= now_ms()
                 assert job.requested_at == original_request
                 assert await db.get(CollectionJob, (project, startup_afk)) is not None
+
+            await listener._update_presence(
+                {steam_id: "online"},
+                observed + 2,
+                seed=True,
+                server_info={steam_id: (163, True)},
+            )
+            await listener._update_presence({steam_id: "offline"}, observed + 90_000_000_000)
+            async with sessions.begin() as db:
+                player = await db.get(PlayerPresence, (project, steam_id))
+                assert player.status == "offline" and player.session_key is None
+                assert not await db.scalar(select(player_is_online(project, steam_id)))
+                task = await db.get(CollectionJob, (project, steam_id))
+                assert task.due_at is None
+                await collect(db, client, task, ModerationSettings())
+                assert task.due_at is None
+                recorded = await db.scalar(
+                    select(ObservedPlay).where(
+                        ObservedPlay.project_id == project,
+                        ObservedPlay.steam_id == steam_id,
+                    )
+                )
+                assert recorded.server_id == 163 and recorded.ended_at > recorded.started_at
     finally:
         await engine.dispose()

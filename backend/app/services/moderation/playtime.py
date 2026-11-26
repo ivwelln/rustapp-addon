@@ -1,5 +1,11 @@
 from collections.abc import Iterable
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.crud.player_data import stored_sessions
+from app.crud.presence import PRESENT
+from app.models import ObservedPlay, PlayerPresence
 from app.services.moderation.facts import MINUTE, Session
 
 YEAR_MS = 365 * 24 * 60 * MINUTE
@@ -24,3 +30,53 @@ def played_ms(sessions: Iterable[Session], server_id: int, now: int) -> int:
             total += end - start
             covered_until = end
     return total
+
+
+async def known_sessions(
+    db: AsyncSession,
+    project: int,
+    steam_id: str,
+    presence: PlayerPresence | None,
+    now: int,
+) -> list[Session]:
+    records = [
+        session
+        for session in await stored_sessions(db, project, steam_id)
+        if session.disconnected_at is not None
+    ]
+    observed = await db.scalars(
+        select(ObservedPlay).where(
+            ObservedPlay.project_id == project,
+            ObservedPlay.steam_id == steam_id,
+            ObservedPlay.ended_at > now - YEAR_MS,
+        )
+    )
+    records.extend(
+        Session(
+            project_id=project,
+            steam_id=steam_id,
+            server_id=record.server_id,
+            connected_at=record.started_at,
+            joined_at=record.started_at,
+            disconnected_at=record.ended_at,
+            is_license=None if record.is_pirated is None else not record.is_pirated,
+        )
+        for record in observed
+    )
+    if (
+        presence is not None
+        and presence.status in PRESENT
+        and presence.server_id is not None
+        and presence.server_since is not None
+    ):
+        records.append(
+            Session(
+                project_id=project,
+                steam_id=steam_id,
+                server_id=presence.server_id,
+                connected_at=presence.server_since,
+                joined_at=presence.server_since,
+                is_license=None if presence.is_pirated is None else not presence.is_pirated,
+            )
+        )
+    return sorted(records, key=lambda item: item.connected_at)

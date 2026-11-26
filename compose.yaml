@@ -79,6 +79,7 @@ services:
       target: prod
     command: ["python", "-m", "app.workers.listen_player_status"]
     init: true
+    restart: unless-stopped
     read_only: true
     cap_drop:
       - ALL

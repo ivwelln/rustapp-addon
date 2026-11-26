@@ -52,4 +52,28 @@ class PlayerPresence(Base):
     project_id: Mapped[int] = mapped_column(primary_key=True)
     steam_id: Mapped[str] = mapped_column(Text, primary_key=True)
     is_afk: Mapped[bool]
+    status: Mapped[str | None] = mapped_column(Text)
     observed_at: Mapped[int] = mapped_column(BigInteger)
+    active_since: Mapped[int | None] = mapped_column(BigInteger)
+    first_active_at: Mapped[int | None] = mapped_column(BigInteger)
+    connecting_at: Mapped[int | None] = mapped_column(BigInteger)
+    joined_at: Mapped[int | None] = mapped_column(BigInteger)
+    server_id: Mapped[int | None]
+    server_since: Mapped[int | None] = mapped_column(BigInteger)
+    server_verified_at: Mapped[int | None] = mapped_column(BigInteger)
+    is_pirated: Mapped[bool | None]
+
+    @property
+    def session_key(self) -> int | None:
+        return (self.connecting_at or self.active_since) if self.active_since is not None else None
+
+
+class ObservedPlay(Base):
+    __tablename__ = "rustapp_observed_play"
+
+    project_id: Mapped[int] = mapped_column(primary_key=True)
+    steam_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    started_at: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    server_id: Mapped[int]
+    ended_at: Mapped[int] = mapped_column(BigInteger)
+    is_pirated: Mapped[bool | None]
