@@ -46,7 +46,7 @@ MARKER = "rustapp-addon:"
 async def usable_ban(db: AsyncSession, project: int, ban: dict) -> bool:
     if (
         ban.get("computed_is_active") is not True
-        or str(ban.get("reason", "")).strip().casefold() != "Чит"
+        or str(ban.get("reason", "")).strip().casefold() != "чит"
     ):
         return False
     marker = str(ban.get("comment", "")).partition(" | ")[0]
