@@ -9,7 +9,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient
 from app.clients.rustapp.exceptions import (
     PlayerNotOnline,
@@ -20,7 +19,8 @@ from app.clients.rustapp.exceptions import (
 )
 from app.clients.rustapp.moderation import is_player, read, results
 from app.core.config import ModerationSettings
-from app.crud.moderation import archive, now_ms
+from app.crud.moderation import archive, claim_ban, now_ms
+from app.crud.moderation_control import autoban_enabled
 from app.crud.player_data import known_sessions
 from app.crud.players import whitelist_for_playtime, whitelisted
 from app.crud.presence import player_is_afk, presence_is_current, save_presence
@@ -36,17 +36,18 @@ from app.services.moderation.eligibility import (
 )
 from app.services.moderation.evaluate import PRIORITY, describe
 from app.services.moderation.facts import MINUTE
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, live_playtime
 
 logger = logging.getLogger(__name__)
 
 MARKER = "rustapp-addon:"
+CHEATING_BAN_REASON = "Чит"
 
 
 async def usable_ban(db: AsyncSession, project: int, ban: dict) -> bool:
     if (
         ban.get("computed_is_active") is not True
-        or str(ban.get("reason", "")).strip().casefold() != "чит"
+        or str(ban.get("reason", "")).strip().casefold() != CHEATING_BAN_REASON.casefold()
     ):
         return False
     marker = str(ban.get("comment", "")).partition(" | ")[0]
@@ -261,13 +262,11 @@ async def deliver(
     client: RustAppClient,
     project: int,
     settings: ModerationSettings,
-    guard: BanGuard,
 ) -> None:
-    if not settings.enforce:
-        return
-    # The guard commits the claim before sending, so ambiguous PUTs keep their slot.
     async with sessions.begin() as db:
-        if not await presence_is_current(db, project, now_ms()):
+        if not await autoban_enabled(db, project) or not await presence_is_current(
+            db, project, now_ms()
+        ):
             return
         other = aliased(Decision)
         unresolved = (
@@ -294,8 +293,6 @@ async def deliver(
         )
         if row is None:
             return
-        if not await guard.available():
-            return
         sid = row.steam_id
         key = row.id
         if row.verdict in ("false_positive", "inconclusive") or await whitelisted(
@@ -314,6 +311,7 @@ async def deliver(
             return
         profile_observed_at = time_ns()
         profile, details = await fetch_profile(client, project, sid)
+        hours_observed_at = now_ms()
         if (
             await cache_profile(db, project, sid, details)
             or profile.last_no_license is not True
@@ -386,9 +384,10 @@ async def deliver(
                 )
                 return
         # Ban history pagination can outlive a session. Refresh the client identity again
-        # if the earlier profile is no longer recent, before reserving a guard slot.
+        # if the earlier profile is no longer recent, before claiming the decision.
         if time_ns() - profile_observed_at > 10_000_000_000:
             profile, details = await fetch_profile(client, project, sid)
+            hours_observed_at = now_ms()
             if (
                 await cache_profile(db, project, sid, details)
                 or profile.last_no_license is not True
@@ -398,26 +397,35 @@ async def deliver(
             ):
                 row.state = "cancelled"
                 return
-        if not await verify_ban_hours(db, client, row):
+        live = live_playtime(details, hours_observed_at)
+        if live is not None and not live.matches(current):
+            live = None
+        if not await verify_ban_hours(db, client, row, live):
             return
         row.ban_ip = target_ip
         body = {
             "steam_id": sid,
             "ban_ip_active": True,
             "ban_ip": target_ip,
-            "reason": "чит",
+            "reason": CHEATING_BAN_REASON,
             "proofs": [],
             "server_ids": [],
             "comment": f"{marker} | {reason}",
             "destroy_buildings": False,
         }
-    if not await guard.claim(key, pattern, target_ip):
-        return
+    # Commit the claim before sending so ambiguous PUTs stay available for reconciliation.
+    async with sessions.begin() as db:
+        if not await claim_ban(db, project, key, pattern, target_ip):
+            return
     try:
         async with sessions.begin() as db:
+            enabled = await autoban_enabled(db, project, lock=True)
             trusted = await whitelisted(db, project, sid, lock=True)
             claimed = await db.get(Decision, key, with_for_update=True)
             if claimed.state != "sending":
+                return
+            if not enabled:
+                claimed.state = "pending"
                 return
             if trusted or claimed.verdict in ("false_positive", "inconclusive"):
                 claimed.state = "cancelled"

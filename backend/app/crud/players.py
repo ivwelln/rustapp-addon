@@ -53,11 +53,21 @@ async def upsert_player_client_kinds(
                     (newer, incoming.client_kind_observed_at), else_=Player.client_kind_observed_at
                 ),
                 "is_whitelisted": or_(Player.is_whitelisted, incoming.is_whitelisted),
-                "whitelist_reason": func.coalesce(
-                    Player.whitelist_reason, incoming.whitelist_reason
+                "whitelist_reason": case(
+                    (
+                        Player.whitelist_reason == "manual",
+                        func.coalesce(incoming.whitelist_reason, Player.whitelist_reason),
+                    ),
+                    else_=func.coalesce(Player.whitelist_reason, incoming.whitelist_reason),
                 ),
             },
-            where=or_(newer, and_(incoming.is_whitelisted, ~Player.is_whitelisted)),
+            where=or_(
+                newer,
+                and_(
+                    incoming.is_whitelisted,
+                    or_(~Player.is_whitelisted, Player.whitelist_reason == "manual"),
+                ),
+            ),
         )
     )
 

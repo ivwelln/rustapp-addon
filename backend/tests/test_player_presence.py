@@ -14,6 +14,7 @@ from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import RustAppTransportError
 from app.core.config import ModerationSettings, Settings
 from app.crud.moderation import archive, enqueue, now_ms
+from app.crud.moderation_control import DEFAULT_POLL_SECONDS
 from app.crud.presence import (
     confirm_presence_connection,
     is_afk,
@@ -139,6 +140,8 @@ async def test_first_check_refreshes_annual_hours_before_combat(intake, monkeypa
 
     def reply(request):
         requests.append(request.url.path)
+        if request.url.path == f"/players/{steam_id}/details":
+            return httpx2.Response(200, json={"player": profile})
         assert request.url.path == f"/players/{steam_id}/stats"
         start = int(request.url.params["time_from"])
         end = int(request.url.params["time_to"])
@@ -199,7 +202,7 @@ async def test_first_check_refreshes_annual_hours_before_combat(intake, monkeypa
                 assert player.is_whitelisted and player.whitelist_reason == "playtime"
                 assert job.due_at is None
                 await collect(db, client, job, ModerationSettings())
-        assert requests == [f"/players/{steam_id}/stats"]
+        assert requests == [f"/players/{steam_id}/details", f"/players/{steam_id}/stats"]
     finally:
         await engine.dispose()
 
@@ -251,7 +254,7 @@ async def test_afk_pauses_requests_and_online_wakes_existing_job():
                 assert eligible is None
                 job = await db.get(CollectionJob, (project, steam_id))
                 await collect(db, client, job, ModerationSettings())
-                job.due_at = now_ms() + ModerationSettings().poll_seconds * 1000
+                job.due_at = now_ms() + DEFAULT_POLL_SECONDS * 1000
 
             await listener._update_presence(
                 {steam_id: "online", startup_afk: "online"}, observed + 1

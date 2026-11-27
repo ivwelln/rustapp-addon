@@ -6,10 +6,20 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.rustapp.exceptions import RustAppResponseError
+from app.clients.rustapp.moderation import Profile
 from app.crud.presence import presence_is_current
 from app.models import Player, PlayerPlaytime, PlayerPresence, ResearchCase, ResearchSource
+from app.services.moderation.playtime import live_playtime
 from app.services.research.cases import ELIGIBLE, VERSION
-from app.services.research.playtime import DAY, cache_days, missing_range
+from app.services.research.playtime import (
+    CONTROL_MS,
+    DAY,
+    active_playtime,
+    cache_days,
+    combined_playtime,
+    missing_range,
+    save_live_playtime,
+)
 from app.services.research.snapshots import Snapshot, cached_sample, finish, prepare
 
 logger = logging.getLogger(__name__)
@@ -148,8 +158,73 @@ async def claim_hours(db: AsyncSession, project: int, server: int, now: int) -> 
     return Work(cache.steam_id, "stats", params, None, "", 0)
 
 
+async def claim_live_hours(db: AsyncSession, project: int, server: int, now: int) -> Work | None:
+    if not await presence_is_current(db, project, now):
+        return None
+    selected = (
+        select(ResearchCase.id)
+        .where(
+            ResearchCase.project_id == project,
+            ResearchCase.server_id == server,
+            ResearchCase.steam_id == PlayerPlaytime.steam_id,
+            ResearchCase.version == VERSION,
+            ResearchCase.label.in_(ELIGIBLE),
+        )
+        .exists()
+    )
+    live = active_playtime(now)
+    total = combined_playtime(now)
+    potential = func.greatest(
+        total + now - PlayerPlaytime.live_checked_at,
+        func.greatest(PlayerPlaytime.project_ms, PlayerPlaytime.annual_ms, 0)
+        + now
+        - PlayerPresence.active_since,
+    )
+    cache = await db.scalar(
+        select(PlayerPlaytime)
+        .join(
+            Player,
+            (Player.project_id == PlayerPlaytime.project_id)
+            & (Player.steam_id == PlayerPlaytime.steam_id),
+        )
+        .join(
+            PlayerPresence,
+            (PlayerPresence.project_id == PlayerPlaytime.project_id)
+            & (PlayerPresence.steam_id == PlayerPlaytime.steam_id),
+        )
+        .where(
+            PlayerPlaytime.project_id == project,
+            Player.last_client_kind == "pirated",
+            PlayerPresence.status == "online",
+            PlayerPlaytime.live_after <= now,
+            func.coalesce(total, 0) <= CONTROL_MS,
+            potential > CONTROL_MS,
+            (live.is_(None) | (PlayerPlaytime.live_checked_at < now - 900_000)),
+            ~selected,
+        )
+        .order_by(PlayerPlaytime.live_after, PlayerPlaytime.steam_id)
+        .limit(1)
+        .with_for_update(of=PlayerPlaytime, skip_locked=True)
+    )
+    if cache is None:
+        return None
+    cache.live_after = now + 900_000
+    return Work(cache.steam_id, "details", {}, None, "", 0)
+
+
 async def store_work(db: AsyncSession, project: int, job: Work, raw: dict, now: int):
     if job.case_id is None:
+        if job.source == "details":
+            profile = Profile.model_validate(raw.get("player"))
+            if (profile.project_id, profile.steam_id) != (project, job.steam_id):
+                raise RustAppResponseError("Получен профиль другого игрока или проекта")
+            if profile.last_no_license is not True:
+                return
+            live = live_playtime(raw, now)
+            presence = await db.get(PlayerPresence, (project, job.steam_id))
+            if live is not None and presence is not None and live.matches(presence):
+                await save_live_playtime(db, project, job.steam_id, live, presence)
+            return
         cache = await db.get(PlayerPlaytime, (project, job.steam_id), with_for_update=True)
         days = await cache_days(db, project, job.steam_id, raw, job.params, now)
         expected = (job.params["time_to"] + 1 - job.params["time_from"]) // DAY
@@ -187,7 +262,11 @@ async def reschedule(
 ) -> None:
     if job.case_id is None:
         cache = await db.get(PlayerPlaytime, (project, job.steam_id), with_for_update=True)
-        cache.stats_after = due if not terminal else now + 7 * DAY
+        retry_at = due if not terminal else now + 7 * DAY
+        if job.source == "details":
+            cache.live_after = retry_at
+        else:
+            cache.stats_after = retry_at
         return
     source = await db.get(ResearchSource, (job.case_id, job.source), with_for_update=True)
     if source.lease != job.lease:

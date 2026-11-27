@@ -22,6 +22,10 @@ const rowMotion = {duration: 360, easing: "cubic-bezier(.22, 1, .36, 1)"};
 const rowContents = new WeakMap();
 let snapshot = null;
 let snapshotReceivedAt = 0;
+let autobanSaving = false;
+let pollSaving = false;
+let pollDirty = false;
+const whitelistSaving = new Set();
 let activeTab = "players";
 let presenceFilter = "all";
 let lastTableKey = null;
@@ -101,11 +105,26 @@ function rosterRow(record) {
   identity.append(identityGroup);
 
   const whitelist = element("td", "");
-  const icon = element("span", record.trusted ? "✓" : "—", record.trusted ? "trust" : "untrusted");
-  icon.title = record.trusted ? "В белом списке" : "Вне белого списка";
-  icon.setAttribute("role", "img");
-  icon.setAttribute("aria-label", icon.title);
-  whitelist.append(icon);
+  const manual = record.whitelist_reason === "manual";
+  if (record.trusted && !manual) {
+    const icon = element("span", "✓", "trust");
+    icon.title = record.whitelist_reason === "license" ? "Белый список по лицензии"
+      : record.whitelist_reason === "playtime" ? "Белый список по игровому времени"
+      : "В белом списке";
+    icon.setAttribute("role", "img");
+    icon.setAttribute("aria-label", icon.title);
+    whitelist.append(icon);
+  } else {
+    const button = element("button", manual ? "×" : "✓", "whitelist-action");
+    button.type = "button";
+    button.dataset.steamId = record.steam_id;
+    button.dataset.remove = String(manual);
+    button.title = manual ? "Убрать ручную отметку из белого списка" : "Добавить в белый список";
+    button.setAttribute("aria-label", `${button.title} — ${name}`);
+    button.disabled = whitelistSaving.has(record.steam_id);
+    button.addEventListener("click", () => changeWhitelist(record.steam_id, !manual));
+    whitelist.append(button);
+  }
 
   const code = (record.country_code || "").toUpperCase();
   const validCode = /^[A-Z]{2}$/.test(code);
@@ -121,12 +140,16 @@ function rosterRow(record) {
   combat.title = record.priority ? "Вне белого списка: больше 5 убийств и меньше 2 смертей"
     : "Убийства и смерти за 24 часа по собранным данным";
   const hours = record.project_played_ms == null ? "—"
-    : (record.playtime_days < 365 ? "≥ " : "") + number.format(record.project_played_ms / 3600000);
+    : (record.playtime_lower_bound || record.playtime_days < 365 ? "≥ " : "")
+      + number.format(record.project_played_ms / 3600000);
   const playtime = element("td", hours, "number");
   const asOf = record.playtime_as_of && hours !== "—" ? new Date(record.playtime_as_of).toLocaleString("ru-RU") : null;
   playtime.title = asOf
-    ? `Часы RustApp по всем серверам проекта на ${asOf}. Данные за ${record.playtime_days} из 365 дней.`
+    ? `Часы RustApp по всем серверам проекта на ${asOf}.`
     : "Годовые часы RustApp пока неизвестны.";
+  if (record.active_session_ms != null) {
+    playtime.title += ` Текущая сессия по RustApp: ${number.format(record.active_session_ms / 3600000)} ч.`;
+  }
   if (record.trained) playtime.title += " Исследовательский срез готов.";
   row.append(identity, element("td", record.steam_id, "steam"), whitelist,
     valueCell(record.provider || null), country, playtime, combat);
@@ -174,6 +197,7 @@ function renderDecision(record) {
     body.append(factsList([
       ["Проверка допуска к бану", evidenceDate(check.checked_at)],
       ["Часы RustApp за 365 дней", check.project_ms == null ? "Недостаточно данных" : number.format(check.project_ms / 3600000)],
+      ["В том числе текущая сессия, ч", check.active_session_ms == null ? null : number.format(check.active_session_ms / 3600000)],
       ["Пиратский клиент подтверждён", check.pirated ? "Да" : null],
     ]));
   }
@@ -424,6 +448,115 @@ function renderChart() {
 }
 
 
+function renderAutoban() {
+  const enabled = snapshot?.autoban_enabled;
+  const state = get("autoban-state");
+  const button = get("autoban-toggle");
+  state.textContent = enabled == null ? "…" : enabled ? "Включены" : "Выключены";
+  state.dataset.enabled = enabled ?? "";
+  button.textContent = autobanSaving ? "Сохраняем…" : enabled == null ? "Изменить"
+    : enabled ? "Выключить" : "Включить";
+  button.disabled = autobanSaving || enabled == null || get("connection").dataset.state !== "ok";
+}
+
+function dashboardConnected() {
+  return get("connection").dataset.state === "ok";
+}
+
+async function changeWhitelist(steamId, enabled) {
+  if (!dashboardConnected() || whitelistSaving.has(steamId)) return;
+  const message = get("whitelist-message");
+  whitelistSaving.add(steamId);
+  renderWhitelistActions();
+  message.hidden = true;
+  try {
+    const response = await fetch(`/api/dashboard/players/${encodeURIComponent(steamId)}/whitelist`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({enabled}),
+    });
+    if (!response.ok) throw new Error();
+    const refreshed = await fetch("/api/dashboard");
+    if (refreshed.ok) showSnapshot(await refreshed.json());
+  } catch {
+    message.textContent = "Не удалось обновить белый список. Проверьте состояние игрока и повторите.";
+    message.hidden = false;
+  } finally {
+    whitelistSaving.delete(steamId);
+    renderWhitelistActions();
+  }
+}
+
+function renderWhitelistActions() {
+  for (const button of get("rows").querySelectorAll(".whitelist-action")) {
+    button.disabled = !dashboardConnected() || whitelistSaving.has(button.dataset.steamId);
+  }
+}
+
+function renderPollInterval() {
+  const input = get("poll-seconds");
+  const interval = snapshot?.poll_seconds;
+  if (!pollDirty && interval != null) input.value = interval;
+  input.disabled = pollSaving || interval == null || !dashboardConnected();
+  get("poll-save").disabled = input.disabled || !input.validity.valid
+    || input.valueAsNumber === interval;
+}
+
+get("poll-seconds").addEventListener("input", () => {
+  pollDirty = true;
+  get("poll-message").hidden = true;
+  renderPollInterval();
+});
+
+get("poll-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (get("poll-save").disabled) return;
+  const seconds = get("poll-seconds").valueAsNumber;
+  const message = get("poll-message");
+  pollSaving = true;
+  message.hidden = true;
+  renderPollInterval();
+  try {
+    const response = await fetch("/api/dashboard/poll-interval", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({seconds}),
+    });
+    if (!response.ok) throw new Error();
+    snapshot.poll_seconds = (await response.json()).seconds;
+    pollDirty = false;
+  } catch {
+    message.textContent = "Не удалось сохранить интервал.";
+    message.hidden = false;
+  } finally {
+    pollSaving = false;
+    renderPollInterval();
+  }
+});
+
+get("autoban-toggle").addEventListener("click", async () => {
+  const enabled = !snapshot.autoban_enabled;
+  const message = get("autoban-message");
+  autobanSaving = true;
+  message.hidden = true;
+  renderAutoban();
+  try {
+    const response = await fetch("/api/dashboard/autoban", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({enabled}),
+    });
+    if (!response.ok) throw new Error();
+    snapshot.autoban_enabled = (await response.json()).enabled;
+  } catch {
+    message.textContent = "Не удалось сохранить настройку. Проверьте состояние и повторите.";
+    message.hidden = false;
+  } finally {
+    autobanSaving = false;
+    renderAutoban();
+  }
+});
+
 function showSnapshot(data) {
   if (snapshot && data.updated_at < snapshot.updated_at) return;
   snapshot = data;
@@ -440,27 +573,29 @@ function showSnapshot(data) {
   get("stored-players").textContent = data.storage ? number.format(data.storage.players) : "—";
   get("stored-kills").textContent = data.storage ? number.format(data.storage.kills) : "—";
   get("project-meta").textContent = `Проект №${data.project}`;
-  get("guard").textContent = `${data.guard.used} / ${data.guard.limit}`;
-  const exhausted = data.guard.used >= data.guard.limit;
-  get("guard").dataset.limit = exhausted;
-  get("guard-status").textContent = exhausted ? "Достигнут аварийный лимит" : "Занято мест";
   get("updated").textContent = `Обновлено в ${clock.format(new Date(data.updated_at))}`;
   renderChart();
   renderActivity();
+  renderWhitelistActions();
+  renderPollInterval();
 }
 
 function setConnection(state, label, message = "") {
   get("connection").dataset.state = state;
   get("connection-label").textContent = label;
+  get("connection").hidden = !label;
   get("error").hidden = !message;
   get("error").textContent = message;
+  renderAutoban();
+  renderPollInterval();
+  renderWhitelistActions();
   if (!snapshot) renderActivity();
 }
 
 const events = new EventSource("/api/dashboard/events");
 events.addEventListener("snapshot", (event) => {
   showSnapshot(JSON.parse(event.data));
-  setConnection("ok", "Обновляется в реальном времени");
+  setConnection("ok", "");
 });
 events.addEventListener("unavailable", (event) => {
   setConnection("error", "Нет свежих данных", JSON.parse(event.data));

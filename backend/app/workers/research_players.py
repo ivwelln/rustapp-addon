@@ -18,11 +18,18 @@ from app.core.logging import configure_console_logging
 from app.crud.moderation import now_ms
 from app.crud.rustapp_requests import RESEARCH_INTERVAL_MS, account_key
 from app.db.session import open_database_sessions
-from app.models import Player, PlayerPlaytime, PlaytimeDay, RustAppGate
+from app.models import Player, PlayerPlaytime, PlayerPresence, PlaytimeDay, RustAppGate
 from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS
 from app.services.research.cases import sync_cases
-from app.services.research.playtime import DAY, refresh_hours
-from app.services.research.queue import claim_hours, claim_source, hydrate, reschedule, store_work
+from app.services.research.playtime import DAY, combined_playtime, refresh_hours
+from app.services.research.queue import (
+    claim_hours,
+    claim_live_hours,
+    claim_source,
+    hydrate,
+    reschedule,
+    store_work,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +57,24 @@ async def maintain(sessions, project: int, server: int) -> None:
             .group_by(PlaytimeDay.steam_id)
             .having(func.sum(PlaytimeDay.played_ms) >= WHITELIST_PLAYTIME_MS)
         )
+        active = (
+            select(PlayerPlaytime.steam_id)
+            .join(
+                PlayerPresence,
+                (PlayerPresence.project_id == PlayerPlaytime.project_id)
+                & (PlayerPresence.steam_id == PlayerPlaytime.steam_id),
+            )
+            .where(
+                PlayerPlaytime.project_id == project,
+                combined_playtime(now) >= WHITELIST_PLAYTIME_MS,
+            )
+        )
         await db.execute(
             update(Player)
             .where(
                 Player.project_id == project,
                 ~Player.is_whitelisted,
-                Player.steam_id.in_(total),
+                Player.steam_id.in_(total) | Player.steam_id.in_(active),
             )
             .values(is_whitelisted=True, whitelist_reason="playtime")
         )
@@ -78,9 +97,14 @@ async def request_step(sessions, client, project: int, server: int, account: str
                 if now // RESEARCH_INTERVAL_MS % 3 == 0
                 else (claim_source, claim_hours)
             )
-            job = await planners[0](db, project, server, now)
+            live_turn = now // RESEARCH_INTERVAL_MS % 6 == 0
+            job = await claim_live_hours(db, project, server, now) if live_turn else None
+            if job is None:
+                job = await planners[0](db, project, server, now)
             if job is None:
                 job = await planners[1](db, project, server, now)
+            if job is None and not live_turn:
+                job = await claim_live_hours(db, project, server, now)
         if job is None:
             return now + 15_000
         sent, terminal = True, False

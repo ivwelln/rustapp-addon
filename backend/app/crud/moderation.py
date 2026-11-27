@@ -2,10 +2,12 @@ import logging
 from collections.abc import Iterable
 from time import time_ns
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
+from app.crud.moderation_control import autoban_enabled
 from app.crud.player_data import save_response
 from app.models.moderation import CollectionJob, CombatKill, Decision, Observation, ReferenceBan
 from app.models.player import Player
@@ -100,6 +102,52 @@ async def enqueue_report(db: AsyncSession, project: int, steam_id: str, report: 
         job.due_at = at if job.due_at is None else min(at, job.due_at)
         job.report_pending = True
     return True
+
+
+async def set_manual_whitelist(
+    db: AsyncSession, project: int, steam_id: str, enabled: bool
+) -> tuple[bool, str | None]:
+    key = (project, steam_id)
+    if enabled:
+        statement = insert(Player).values(
+            project_id=project, steam_id=steam_id, is_whitelisted=True, whitelist_reason="manual"
+        )
+        await db.execute(
+            statement.on_conflict_do_update(
+                index_elements=[Player.project_id, Player.steam_id],
+                set_={"is_whitelisted": True, "whitelist_reason": "manual"},
+                where=~Player.is_whitelisted,
+            )
+        )
+    else:
+        manual_entry = (
+            Player.project_id == project,
+            Player.steam_id == steam_id,
+            Player.whitelist_reason == "manual",
+        )
+        if await db.scalar(select(Player.steam_id).where(*manual_entry)) is not None:
+            presence = await db.get(PlayerPresence, key)
+            job = None
+            if presence is not None and presence.status in ("online", "afk"):
+                # Match the collection worker's lock order before requeueing the player.
+                await db.execute(
+                    insert(CollectionJob)
+                    .values(project_id=project, steam_id=steam_id, requested_at=now_ms())
+                    .on_conflict_do_nothing()
+                )
+                job = await db.get(CollectionJob, key, with_for_update=True)
+            removed = await db.scalar(
+                update(Player)
+                .where(*manual_entry)
+                .values(is_whitelisted=False, whitelist_reason=None)
+                .returning(Player.steam_id)
+            )
+            if removed is not None and job is not None:
+                at = now_ms()
+                job.requested_at = max(at, (job.collected_at or 0) + 1)
+                job.due_at = at
+    player = await db.get(Player, key)
+    return (player.is_whitelisted, player.whitelist_reason) if player is not None else (False, None)
 
 
 async def latest(db: AsyncSession, project: int, sid: str, source: str) -> Observation | None:
@@ -199,9 +247,7 @@ async def reference_bans(
     )
 
 
-async def save_decision(
-    db: AsyncSession, session: Session, matches: dict, *, enforce: bool
-) -> None:
+async def save_decision(db: AsyncSession, session: Session, matches: dict) -> None:
     if not matches:
         return
     decision = await db.scalar(
@@ -236,6 +282,7 @@ async def save_decision(
         decision.joined_at = session.joined_at
     decision.matches = {**matches, **previous}
     decision.primary_pattern, decision.action = outcome(decision.matches)
+    enforce = decision.action == "ban" and await autoban_enabled(db, session.project_id)
     if not enforce and decision.action == "ban" and decision.primary_pattern != previous_primary:
         await db.flush()
         logger.info(
@@ -261,3 +308,35 @@ async def save_decision(
             session.steam_id,
             decision.primary_pattern,
         )
+
+
+async def claim_ban(
+    db: AsyncSession, project: int, decision_id: int, pattern: str, ban_ip: str
+) -> bool:
+    # Serialize claims so a second worker cannot dispatch while the same player's PUT is unresolved.
+    await db.execute(select(func.pg_advisory_xact_lock(912_438, project)))
+    other = aliased(Decision)
+    in_flight = (
+        select(other.id)
+        .where(
+            other.project_id == project,
+            other.steam_id == Decision.steam_id,
+            other.state == "sending",
+        )
+        .exists()
+    )
+    claimed = await db.scalar(
+        update(Decision)
+        .where(
+            Decision.project_id == project,
+            Decision.id == decision_id,
+            Decision.state == "pending",
+            Decision.action == "ban",
+            Decision.primary_pattern == pattern,
+            Decision.ban_ip == ban_ip,
+            ~in_flight,
+        )
+        .values(state="sending")
+        .returning(Decision.id)
+    )
+    return claimed is not None

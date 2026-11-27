@@ -22,6 +22,13 @@ class PlayerPlaytime(Base):
     steam_id: Mapped[str] = mapped_column(Text, primary_key=True)
     annual_ms: Mapped[int | None] = mapped_column(BigInteger)
     annual_checked_at: Mapped[int | None] = mapped_column(BigInteger)
+    annual_before: Mapped[int | None] = mapped_column(BigInteger)
+    live_started_at: Mapped[int | None] = mapped_column(BigInteger)
+    live_ms: Mapped[int | None] = mapped_column(BigInteger)
+    live_checked_at: Mapped[int | None] = mapped_column(BigInteger)
+    live_session_key: Mapped[int | None] = mapped_column(BigInteger)
+    live_server_id: Mapped[int | None]
+    live_after: Mapped[int] = mapped_column(BigInteger, server_default="0")
     calculated_at: Mapped[int] = mapped_column(BigInteger, server_default="0")
     next_calculation: Mapped[int] = mapped_column(BigInteger, server_default="0")
     first_join_at: Mapped[int | None] = mapped_column(BigInteger)

@@ -10,21 +10,40 @@ from app.clients.rustapp.exceptions import RustAppHTTPError, RustAppResponseErro
 from app.clients.rustapp.moderation import Profile, parse_kill, read, results
 from app.core.config import ModerationSettings
 from app.crud.moderation import archive, now_ms, reference_bans, save_decision, save_kill
+from app.crud.moderation_control import player_poll_seconds
 from app.crud.player_data import known_sessions, save_ip, save_reports
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
 from app.crud.presence import PRESENT, observe_server, presence_is_current
-from app.models import CollectionJob, CombatKill, PlayerData, PlayerPresence, ReferenceBan
+from app.models import (
+    CollectionJob,
+    CombatKill,
+    PlayerData,
+    PlayerPlaytime,
+    PlayerPresence,
+    ReferenceBan,
+)
 from app.services.moderation.eligibility import annual_ms, cached_project_ms
 from app.services.moderation.evaluate import evaluate
 from app.services.moderation.facts import MINUTE, Facts, Kill, Session
 from app.services.moderation.kill_feed import PAGE_LIMIT, update_coverage
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, YEAR_MS
-from app.services.research.playtime import HOUR, cache_days, daily_playtime, save_annual
+from app.services.moderation.playtime import (
+    WHITELIST_PLAYTIME_MS,
+    YEAR_MS,
+    LivePlaytime,
+    live_playtime,
+)
+from app.services.research.playtime import (
+    DAY,
+    HOUR,
+    cache_days,
+    daily_playtime,
+    save_annual,
+    save_live_playtime,
+)
 
 logger = logging.getLogger(__name__)
 
 JOIN_DATA_TTL = 10 * MINUTE
-MIN_PLAYTIME_CHECK_MS = 10 * MINUTE
 PLAYTIME_RETRY_MS = 15 * MINUTE
 
 
@@ -38,6 +57,11 @@ async def fetch_profile(client: RustAppClient, project: int, sid: str) -> tuple[
 
 async def cache_profile(db: AsyncSession, project: int, sid: str, data: dict) -> bool:
     await archive(db, project, sid, "details", data)
+    live = live_playtime(data, now_ms())
+    if live is not None:
+        presence = await db.get(PlayerPresence, (project, sid), populate_existing=True)
+        if presence is not None and live.matches(presence):
+            await save_live_playtime(db, project, sid, live, presence)
     raw_player = data["player"]
     signed_at = (raw_player.get("steam_data") or {}).get("signed_at")
     if type(signed_at) is int and signed_at > 0:
@@ -67,18 +91,41 @@ async def cache_profile(db: AsyncSession, project: int, sid: str, data: dict) ->
     return True
 
 
-async def screen_playtime(db: AsyncSession, client: RustAppClient, job: CollectionJob) -> bool:
+async def screen_playtime(
+    db: AsyncSession, client: RustAppClient, job: CollectionJob, live: LivePlaytime | None
+) -> int:
     project, sid, end = job.project_id, job.steam_id, now_ms()
     start = end - YEAR_MS + 1
-    params = {"time_from": start, "time_to": end}
-    job.playtime_due_at = end + PLAYTIME_RETRY_MS
+    cutoff = live.started_at - 1 if live else end
+    measured = live.within_year(end) if live else 0
+    cached_history = await cached_project_ms(db, project, sid, end, before=cutoff + 1)
+    if live is not None:
+        cached = await db.get(PlayerPlaytime, (project, sid))
+        if (
+            cached is not None
+            and cached.annual_ms is not None
+            and cached.annual_checked_at is not None
+            and (cached.annual_before or cached.annual_checked_at) <= live.started_at
+        ):
+            # At most the elapsed time can move out of the old rolling window.
+            cached_history = max(
+                cached_history, cached.annual_ms - max(0, end - cached.annual_checked_at)
+            )
+    confirmed = cached_history + measured
+    if confirmed >= WHITELIST_PLAYTIME_MS:
+        return confirmed
+    params = {"time_from": start, "time_to": cutoff}
+    delay = PLAYTIME_RETRY_MS
+    if live is not None:
+        delay = min(delay, max(1000, WHITELIST_PLAYTIME_MS - confirmed))
+    job.playtime_due_at = end + delay
     try:
         payload = await read(client, f"/players/{sid}/stats", **params)
     except RustAppHTTPError as exc:
         if exc.status_code not in (400, 404, 422):
             raise
         await archive(db, project, sid, "stats", {"http_status": exc.status_code}, params=params)
-        return False
+        return confirmed
 
     observed = now_ms()
     await archive(db, project, sid, "stats", payload, params=params)
@@ -86,26 +133,21 @@ async def screen_playtime(db: AsyncSession, client: RustAppClient, job: Collecti
         await cache_days(db, project, sid, payload, params, observed)
     except RustAppResponseError:
         logger.debug("Статистика без подтверждённых дневных часов | SteamID=%s", sid)
-        return False
+        return confirmed
     try:
-        confirmed = annual_ms(payload, sid, start, end)
+        history = annual_ms(payload, sid, start, cutoff)
     except RustAppResponseError:
         # Dated hours inside the requested window can already prove the protection threshold.
-        confirmed = sum(
+        history = sum(
             duration
             for day, duration in daily_playtime(payload, sid).items()
-            if start <= day <= end
+            if start <= day and day + DAY <= cutoff + 1
         )
     else:
-        await save_annual(db, project, sid, confirmed, end)
-        # This schedules a GET. Only the next RustApp response can grant more hours.
-        job.playtime_due_at = end + max(MIN_PLAYTIME_CHECK_MS, WHITELIST_PLAYTIME_MS - confirmed)
-    if confirmed < WHITELIST_PLAYTIME_MS:
-        return False
-    await whitelist_for_playtime(db, project, sid)
-    job.collected_at, job.due_at, job.playtime_due_at = observed, None, None
-    logger.info("Белый список по часам RustApp | SteamID=%s часы от %.2f", sid, confirmed / HOUR)
-    return True
+        await save_annual(db, project, sid, history, end, before=live.started_at if live else None)
+        # The expected crossing schedules a refresh. Only a RustApp reply can confirm it.
+        job.playtime_due_at = end + max(1000, WHITELIST_PLAYTIME_MS - history - measured)
+    return max(confirmed, history + measured)
 
 
 async def collect(
@@ -125,7 +167,7 @@ async def collect(
     if presence is None or presence.active_since is None:
         awaiting_entry = presence is None or presence.status in ("joining", None)
         job.due_at = (
-            now + settings.poll_seconds * 1000
+            now + await player_poll_seconds(db, project) * 1000
             if awaiting_entry and now - job.requested_at < 5 * MINUTE
             else None
         )
@@ -136,9 +178,6 @@ async def collect(
     job.report_pending = False
     previous = job.collected_at
     fresh = previous is None or job.requested_at > previous or active_since > previous
-    if fresh or job.playtime_due_at is None or job.playtime_due_at <= now:
-        if await screen_playtime(db, client, job):
-            return
     if await cached_project_ms(db, project, sid, now) >= WHITELIST_PLAYTIME_MS:
         await whitelist_for_playtime(db, project, sid)
         logger.info("Белый список по сохранённым дням RustApp | SteamID=%s", sid)
@@ -152,16 +191,30 @@ async def collect(
 
     last_profile = cached.get("details", {}).get("payload")
     observed_profile_at: int | None = None
-    if last_profile is None or (fresh and needs_refresh("details")) or presence.server_id is None:
+    check_playtime = fresh or job.playtime_due_at is None or job.playtime_due_at <= now
+    live = None
+    if check_playtime or last_profile is None or presence.server_id is None:
         observed_profile_at = now_ms()
         profile, data = await fetch_profile(client, project, sid)
         if await cache_profile(db, project, sid, data):
             job.collected_at, job.due_at = now, None
             logger.info("Белый список: добавлен игрок по лицензии из профиля | SteamID=%s", sid)
             return
+        sample = live_playtime(data, now_ms())
+        if sample is not None and sample.matches(presence):
+            live = sample
     else:
         profile = Profile.model_validate(last_profile["player"])
         logger.debug("PostgreSQL: профиль использован из кэша | SteamID=%s", sid)
+    if check_playtime:
+        confirmed = await screen_playtime(db, client, job, live)
+        if confirmed >= WHITELIST_PLAYTIME_MS:
+            await whitelist_for_playtime(db, project, sid)
+            job.collected_at, job.due_at, job.playtime_due_at = now_ms(), None, None
+            logger.info(
+                "Белый список по часам RustApp | SteamID=%s часы от %.2f", sid, confirmed / HOUR
+            )
+            return
     now = now_ms()
     base = f"/players/{sid}/"
     for source, params in (
@@ -237,7 +290,7 @@ async def collect(
             await save_kill(db, project, row["server_id"], sid, kill, row)
 
     job.collected_at = now
-    job.due_at = now + settings.poll_seconds * 1000
+    job.due_at = now + await player_poll_seconds(db, project) * 1000
     presence = await db.get(
         PlayerPresence, (project, sid), populate_existing=True, with_for_update=True
     )
@@ -338,4 +391,4 @@ async def collect(
         len(kills),
         ", ".join(sorted(matches)) or "нет",
     )
-    await save_decision(db, current, matches, enforce=settings.enforce)
+    await save_decision(db, current, matches)
