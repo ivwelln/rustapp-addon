@@ -14,8 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.crud.moderation import now_ms
-from app.crud.moderation_control import autoban_enabled, set_autoban
+from app.clients.rustapp.moderation import is_player
+from app.crud.moderation import now_ms, set_manual_whitelist
+from app.crud.moderation_control import (
+    autoban_enabled,
+    player_poll_seconds,
+    set_autoban,
+    set_player_poll_seconds,
+)
 from app.models import (
     CollectionJob,
     CombatDeath,
@@ -58,7 +64,7 @@ async def dashboard_ready(request: Request) -> dict[str, str]:
     try:
         async with sessions() as db:
             await db.execute(select(CombatDeath.event_id).limit(0))
-            await db.execute(select(ModerationControl.project_id).limit(0))
+            await db.execute(select(ModerationControl.poll_seconds).limit(0))
     except (OSError, SQLAlchemyError):
         raise HTTPException(
             status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
@@ -95,10 +101,16 @@ class ModeratorVerdict(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
-class AutobanSetting(BaseModel):
+class EnabledSetting(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: StrictBool
+
+
+class PollIntervalSetting(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: int = Field(strict=True, ge=1, le=2**31 - 1)
 
 
 def verify_same_origin(request: Request) -> None:
@@ -108,7 +120,7 @@ def verify_same_origin(request: Request) -> None:
 
 
 @router.put("/api/dashboard/autoban", include_in_schema=False)
-async def update_autoban(request: Request, response: Response, body: AutobanSetting) -> dict:
+async def update_autoban(request: Request, response: Response, body: EnabledSetting) -> dict:
     verify_same_origin(request)
     response.headers.update(HEADERS)
     sessions = request.app.state.dashboard_sessions
@@ -126,6 +138,50 @@ async def update_autoban(request: Request, response: Response, body: AutobanSett
         "Автобаны %s через панель | проект=%d", "включены" if body.enabled else "выключены", project
     )
     return body.model_dump()
+
+
+@router.put("/api/dashboard/poll-interval", include_in_schema=False)
+async def update_poll_interval(
+    request: Request, response: Response, body: PollIntervalSetting
+) -> dict:
+    verify_same_origin(request)
+    response.headers.update(HEADERS)
+    sessions = request.app.state.dashboard_sessions
+    if sessions is None:
+        raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
+    project = request.app.state.dashboard_project
+    try:
+        async with sessions.begin() as db:
+            await set_player_poll_seconds(db, project, body.seconds)
+    except (OSError, SQLAlchemyError):
+        raise HTTPException(
+            status_code=503, detail="Не удалось сохранить интервал проверок", headers=HEADERS
+        ) from None
+    logger.info("Интервал проверок изменён | проект=%d интервал=%d с", project, body.seconds)
+    return body.model_dump()
+
+
+@router.put("/api/dashboard/players/{steam_id}/whitelist", include_in_schema=False)
+async def update_whitelist(
+    request: Request, response: Response, steam_id: str, body: EnabledSetting
+) -> dict:
+    verify_same_origin(request)
+    response.headers.update(HEADERS)
+    if not is_player(steam_id):
+        raise HTTPException(status_code=422, detail="Некорректный SteamID")
+    sessions = request.app.state.dashboard_sessions
+    if sessions is None:
+        raise HTTPException(status_code=503, detail="PostgreSQL не настроена", headers=HEADERS)
+    try:
+        async with sessions.begin() as db:
+            trusted, reason = await set_manual_whitelist(
+                db, request.app.state.dashboard_project, steam_id, body.enabled
+            )
+    except (OSError, SQLAlchemyError):
+        raise HTTPException(
+            status_code=503, detail="Не удалось изменить белый список", headers=HEADERS
+        ) from None
+    return {"trusted": trusted, "whitelist_reason": reason}
 
 
 @router.get("/api/dashboard/decisions/{decision_id}", include_in_schema=False)
@@ -291,6 +347,7 @@ async def read_snapshot(request: Request) -> dict:
                 )
             ).all()
             enabled = await autoban_enabled(db, project)
+            poll_seconds = await player_poll_seconds(db, project)
     except (OSError, SQLAlchemyError):
         raise HTTPException(
             status_code=503, detail="PostgreSQL или миграции пока недоступны", headers=HEADERS
@@ -309,6 +366,7 @@ async def read_snapshot(request: Request) -> dict:
             timeline.get(first_minute + timedelta(minutes=index), 0) for index in range(60)
         ],
         "autoban_enabled": enabled,
+        "poll_seconds": poll_seconds,
         "players": roster,
         "decisions": [decision_summary(decision) for decision in decisions],
     }

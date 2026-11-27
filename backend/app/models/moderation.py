@@ -10,6 +10,7 @@ class ModerationControl(Base):
 
     project_id: Mapped[int] = mapped_column(primary_key=True)
     autoban_enabled: Mapped[bool] = mapped_column(server_default=true())
+    poll_seconds: Mapped[int] = mapped_column(server_default="150")
 
 
 class CollectionJob(Base):

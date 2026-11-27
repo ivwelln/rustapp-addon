@@ -58,6 +58,7 @@
           </div>
           <input id="search" type="search" placeholder="Имя или SteamID" aria-label="Поиск игроков">
         </div>
+        <p id="whitelist-message" class="notice body-6" role="status" hidden></p>
         <div class="table-scroll" tabindex="0" role="region" aria-label="Таблица мониторинга">
           <table><thead id="columns"></thead><tbody id="rows"></tbody></table>
         </div>
@@ -80,6 +81,14 @@
           <article class="metric">
             <h2>Очередь проверок</h2><strong id="queue">…</strong>
             <p id="ready">Готовы к проверке: …</p>
+            <form id="poll-form">
+              <label for="poll-seconds">Интервал проверок, с</label>
+              <div class="interval-controls">
+                <input id="poll-seconds" type="number" min="1" max="2147483647" step="1" required disabled>
+                <button id="poll-save" type="submit" class="refresh button-sm" disabled>Сохранить</button>
+              </div>
+              <p id="poll-message" role="status" hidden></p>
+            </form>
           </article>
           <article class="metric">
             <h2>Белый список</h2><strong id="trusted">…</strong>

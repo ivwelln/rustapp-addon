@@ -111,6 +111,7 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 PlayerPresence.steam_id,
                 PlayerPresence.status,
                 trusted.label("trusted"),
+                Player.whitelist_reason,
                 priority.label("priority"),
                 trained.label("trained"),
                 func.greatest(CollectionJob.collected_at, last_feed_at).label("checked_at"),

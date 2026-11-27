@@ -14,6 +14,71 @@ from app.models import CollectionJob, CombatKill, Decision, Observation, Player,
 from app.services.dashboard.roster import DAY_MS, online_players
 
 
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+async def test_dashboard_manual_whitelist_and_live_interval(monkeypatch):
+    project = uuid4().int % (2**30) + 1
+    now = now_ms()
+    normal, reported, licensed, manual = [str(76561198000000010 + index) for index in range(4)]
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    monkeypatch.setattr(app.state, "dashboard_sessions", sessions, raising=False)
+    monkeypatch.setattr(app.state, "dashboard_project", project, raising=False)
+    try:
+        async with sessions.begin() as db:
+            await save_presence(
+                db,
+                project,
+                dict.fromkeys((normal, reported, licensed, manual), "online"),
+                now * 1_000_000,
+            )
+            db.add(
+                Player(
+                    project_id=project,
+                    steam_id=licensed,
+                    is_whitelisted=True,
+                    whitelist_reason="license",
+                )
+            )
+            for steam_id, report_pending in ((normal, False), (reported, True)):
+                db.add(
+                    CollectionJob(
+                        project_id=project,
+                        steam_id=steam_id,
+                        requested_at=now,
+                        collected_at=now,
+                        due_at=now + 150_000,
+                        report_pending=report_pending,
+                    )
+                )
+        async with httpx2.AsyncClient(
+            base_url="http://127.0.0.1", transport=httpx2.ASGITransport(app=app)
+        ) as client:
+            snapshot_path = "/api/dashboard"
+            interval_path = f"{snapshot_path}/poll-interval"
+            whitelist_path = f"{snapshot_path}/players/{manual}/whitelist"
+            assert (await client.get(snapshot_path)).json()["poll_seconds"] == 150
+            assert (await client.put(interval_path, json={"seconds": 0})).status_code == 422
+            changed = await client.put(interval_path, json={"seconds": 45})
+            assert changed.json() == {"seconds": 45}
+            assert (await client.get(snapshot_path)).json()["poll_seconds"] == 45
+            added = await client.put(whitelist_path, json={"enabled": True})
+            assert added.json() == {"trusted": True, "whitelist_reason": "manual"}
+            roster = (await client.get(snapshot_path)).json()["players"]
+            assert next(player for player in roster if player["steam_id"] == manual)["trusted"]
+            automatic = await client.put(
+                f"{snapshot_path}/players/{licensed}/whitelist", json={"enabled": False}
+            )
+            assert automatic.json() == {"trusted": True, "whitelist_reason": "license"}
+            removed = await client.put(whitelist_path, json={"enabled": False})
+            assert removed.json() == {"trusted": False, "whitelist_reason": None}
+        async with sessions() as db:
+            assert (await db.get(CollectionJob, (project, normal))).due_at == now + 45_000
+            assert (await db.get(CollectionJob, (project, reported))).due_at == now + 150_000
+            assert (await db.get(CollectionJob, (project, manual))).due_at <= now_ms()
+    finally:
+        await engine.dispose()
+
+
 async def test_dashboard_is_local_and_assets_are_served():
     transport = httpx2.ASGITransport(app=app)
     async with httpx2.AsyncClient(base_url="http://127.0.0.1", transport=transport) as client:

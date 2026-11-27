@@ -33,10 +33,9 @@ async def run() -> None:
     settings = ModerationSettings()
     project = config.rustapp_project_id
     logger.info(
-        "Модерация запущена | проект=%d сервер=%d интервал=%d с пауза RustApp=%.1f с",
+        "Модерация запущена | проект=%d сервер=%d пауза RustApp=%.1f с",
         project,
         settings.server_id,
-        settings.poll_seconds,
         settings.request_interval,
     )
     async with (

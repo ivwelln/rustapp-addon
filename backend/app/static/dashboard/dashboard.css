@@ -122,6 +122,12 @@ button, .rustapp-player-link { transition: transform 300ms var(--curve); }
 .metric strong[data-enabled="true"] { color: var(--accent); }
 #autoban-state { font: 600 1.25rem/1.75rem var(--font); }
 #autoban-toggle { padding: 4px 9px; }
+#poll-form { width: 100%; margin-top: 5px; }
+#poll-form label { display: block; margin-bottom: 4px; color: var(--muted); font-size: .75rem; }
+.interval-controls { display: flex; flex-wrap: wrap; gap: 4px; }
+.interval-controls input { width: 64px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--control); }
+.interval-controls button { padding: 4px 7px; font-size: .75rem; }
+#poll-message { color: var(--error); }
 p, .metric p, .detail, .table-footer, .traffic-total span, .axis, .archive-totals dt, .rules-list dd { color: var(--muted); }
 .panel-head, .table-tools, .table-footer, .axis { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .activity .panel-head, .table-tools, .table-footer { padding: 12px 16px; }
@@ -180,8 +186,12 @@ tbody tr:hover td { background: var(--control); }
   border-block-end: 1px solid currentColor;
 }
 .steam, .status, .country { white-space: nowrap; }
-.steam, .placeholder, .untrusted { color: var(--muted); }
+.steam, .placeholder { color: var(--muted); }
 .trust { display: inline-grid; place-items: center; width: 24px; height: 24px; background: var(--raised); color: var(--accent); border-radius: 999px; }
+.whitelist-action { display: inline-grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 1px solid var(--border); border-radius: 7px; background: var(--control); color: var(--accent); }
+.whitelist-action[data-remove="true"] { color: var(--error); }
+.whitelist-action:hover:not(:disabled) { background: var(--raised); }
+.whitelist-action:disabled { opacity: .55; }
 .number { font-weight: 600; }
 .combat-cell { white-space: nowrap; }
 .combat-separator { margin-inline: 4px; color: var(--muted); }

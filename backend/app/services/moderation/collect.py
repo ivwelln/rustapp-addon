@@ -10,6 +10,7 @@ from app.clients.rustapp.exceptions import RustAppHTTPError, RustAppResponseErro
 from app.clients.rustapp.moderation import Profile, parse_kill, read, results
 from app.core.config import ModerationSettings
 from app.crud.moderation import archive, now_ms, reference_bans, save_decision, save_kill
+from app.crud.moderation_control import player_poll_seconds
 from app.crud.player_data import known_sessions, save_ip, save_reports
 from app.crud.players import upsert_player_client_kinds, whitelist_for_playtime, whitelisted
 from app.crud.presence import PRESENT, observe_server, presence_is_current
@@ -125,7 +126,7 @@ async def collect(
     if presence is None or presence.active_since is None:
         awaiting_entry = presence is None or presence.status in ("joining", None)
         job.due_at = (
-            now + settings.poll_seconds * 1000
+            now + await player_poll_seconds(db, project) * 1000
             if awaiting_entry and now - job.requested_at < 5 * MINUTE
             else None
         )
@@ -237,7 +238,7 @@ async def collect(
             await save_kill(db, project, row["server_id"], sid, kill, row)
 
     job.collected_at = now
-    job.due_at = now + settings.poll_seconds * 1000
+    job.due_at = now + await player_poll_seconds(db, project) * 1000
     presence = await db.get(
         PlayerPresence, (project, sid), populate_existing=True, with_for_update=True
     )

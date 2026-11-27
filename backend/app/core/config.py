@@ -52,7 +52,6 @@ class ModerationSettings(BaseSettings):
         env_prefix="APP_MODERATION_", env_nested_delimiter="__", frozen=True, extra="ignore"
     )
     server_id: int = Field(default=163, gt=0)
-    poll_seconds: int = Field(default=150, ge=1)
     initial_ban_pages: int = Field(default=1, ge=1)
     request_interval: float = Field(default=1.0, gt=0)
     patterns: Patterns = Patterns()

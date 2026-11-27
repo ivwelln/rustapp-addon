@@ -104,6 +104,52 @@ async def enqueue_report(db: AsyncSession, project: int, steam_id: str, report: 
     return True
 
 
+async def set_manual_whitelist(
+    db: AsyncSession, project: int, steam_id: str, enabled: bool
+) -> tuple[bool, str | None]:
+    key = (project, steam_id)
+    if enabled:
+        statement = insert(Player).values(
+            project_id=project, steam_id=steam_id, is_whitelisted=True, whitelist_reason="manual"
+        )
+        await db.execute(
+            statement.on_conflict_do_update(
+                index_elements=[Player.project_id, Player.steam_id],
+                set_={"is_whitelisted": True, "whitelist_reason": "manual"},
+                where=~Player.is_whitelisted,
+            )
+        )
+    else:
+        manual_entry = (
+            Player.project_id == project,
+            Player.steam_id == steam_id,
+            Player.whitelist_reason == "manual",
+        )
+        if await db.scalar(select(Player.steam_id).where(*manual_entry)) is not None:
+            presence = await db.get(PlayerPresence, key)
+            job = None
+            if presence is not None and presence.status in ("online", "afk"):
+                # Match the collection worker's lock order before requeueing the player.
+                await db.execute(
+                    insert(CollectionJob)
+                    .values(project_id=project, steam_id=steam_id, requested_at=now_ms())
+                    .on_conflict_do_nothing()
+                )
+                job = await db.get(CollectionJob, key, with_for_update=True)
+            removed = await db.scalar(
+                update(Player)
+                .where(*manual_entry)
+                .values(is_whitelisted=False, whitelist_reason=None)
+                .returning(Player.steam_id)
+            )
+            if removed is not None and job is not None:
+                at = now_ms()
+                job.requested_at = max(at, (job.collected_at or 0) + 1)
+                job.due_at = at
+    player = await db.get(Player, key)
+    return (player.is_whitelisted, player.whitelist_reason) if player is not None else (False, None)
+
+
 async def latest(db: AsyncSession, project: int, sid: str, source: str) -> Observation | None:
     return await db.scalar(
         select(Observation)
