@@ -338,4 +338,4 @@ async def collect(
         len(kills),
         ", ".join(sorted(matches)) or "нет",
     )
-    await save_decision(db, current, matches, enforce=settings.enforce)
+    await save_decision(db, current, matches)

@@ -5,7 +5,6 @@ import httpx2
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import (
     PlayerNotOnline,
@@ -34,22 +33,17 @@ async def run() -> None:
     settings = ModerationSettings()
     project = config.rustapp_project_id
     logger.info(
-        "Модерация запущена | проект=%d сервер=%d интервал=%d с пауза RustApp=%.1f с автобаны=%s",
+        "Модерация запущена | проект=%d сервер=%d интервал=%d с пауза RustApp=%.1f с",
         project,
         settings.server_id,
         settings.poll_seconds,
         settings.request_interval,
-        "включены" if settings.enforce else "выключены",
     )
     async with (
         open_database_sessions(DatabaseSettings()) as sessions,
         create_rustapp_http_client(config, request_log=sessions) as http,
-        httpx2.AsyncClient(
-            base_url=settings.ban_guard_url, timeout=3, trust_env=False
-        ) as guard_http,
     ):
         client = RustAppClient(http)
-        guard = BanGuard(guard_http, project)
         loop = asyncio.get_running_loop()
         next_request = 0.0
 
@@ -173,7 +167,7 @@ async def run() -> None:
                         if next_check is not None
                         else "снята с расписания",
                     )
-                await deliver(sessions, client, project, settings, guard)
+                await deliver(sessions, client, project, settings)
             except PlayerNotOnline:
                 logger.debug("Модерация: отправка отложена до подтверждения онлайна")
             except RustAppHTTPError as exc:

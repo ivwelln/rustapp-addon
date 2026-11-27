@@ -311,6 +311,21 @@ async def test_decision_card_persists_local_verdict_and_shows_verified_reference
             assert initial.status_code == 200
             snapshot = await client.get("/api/dashboard")
             assert snapshot.json()["storage"] == {"players": 1, "kills": 1}
+            assert snapshot.json()["autoban_enabled"] is True
+            switch_path = "/api/dashboard/autoban"
+            denied_switch = await client.put(
+                switch_path, json={"enabled": False}, headers={"Origin": "https://other.example"}
+            )
+            assert denied_switch.status_code == 403
+            assert (await client.put(switch_path, json={"enabled": "false"})).status_code == 422
+            disabled = await client.put(
+                switch_path, json={"enabled": False}, headers={"Origin": "http://127.0.0.1"}
+            )
+            assert disabled.json() == {"enabled": False}
+            assert (await client.get("/api/dashboard")).json()["autoban_enabled"] is False
+            assert (await client.put(switch_path, json={"enabled": True})).json() == {
+                "enabled": True
+            }
             assert initial.json()["joined_at"] == now
             assert initial.json()["reference_ban_id"] == 22 and "№22" in initial.json()["reason"]
             assert "192.0.2.4" not in initial.text

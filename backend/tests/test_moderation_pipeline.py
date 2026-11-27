@@ -10,12 +10,11 @@ import pytest
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.ban_guard.api import app as ban_guard_api
-from app.ban_guard.client import BanGuard
 from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import RustAppRequestNotSent, RustAppTimeoutError
 from app.core.config import ModerationSettings, Settings
 from app.crud.moderation import archive, enqueue, now_ms
+from app.crud.moderation_control import set_autoban
 from app.crud.presence import confirm_presence_connection, save_presence
 from app.models import (
     CollectionJob,
@@ -41,6 +40,7 @@ from app.services.moderation.collect import collect
         "missing_ip",
         "already_banned",
         "observe",
+        "pause_before_send",
         "new_session",
         "other_server",
         "became_licensed",
@@ -157,18 +157,15 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
     engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
     sessions = async_sessionmaker(engine)
     config = Settings(rustapp_access_token="test", rustapp_project_id=project)
-    settings = ModerationSettings(enforce=outcome != "observe")
-    ban_guard_api.state.sessions = sessions
+    settings = ModerationSettings()
     try:
-        async with (
-            create_rustapp_http_client(config, transport=httpx2.MockTransport(handle)) as http,
-            httpx2.AsyncClient(
-                base_url="http://ban-guard", transport=httpx2.ASGITransport(app=ban_guard_api)
-            ) as guard_http,
-        ):
-            guard = BanGuard(guard_http, project)
+        async with create_rustapp_http_client(
+            config, transport=httpx2.MockTransport(handle)
+        ) as http:
             client = RustAppClient(http)
             async with sessions.begin() as db:
+                if outcome == "observe":
+                    await set_autoban(db, project, False)
                 await confirm_presence_connection(db, project, now)
                 await save_presence(db, project, {sid: "joining"}, (start - 25) * 1_000_000)
                 await save_presence(
@@ -241,11 +238,11 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                 from app.clients.rustapp.exceptions import RustAppHTTPError
 
                 with pytest.raises(RustAppHTTPError):
-                    await deliver(sessions, client, project, settings, guard)
+                    await deliver(sessions, client, project, settings)
                 assert not submitted
                 return
             if outcome in {"three_hours", "long_playtime", "incomplete_year"}:
-                await deliver(sessions, client, project, settings, guard)
+                await deliver(sessions, client, project, settings)
                 async with sessions() as db:
                     row = await db.scalar(select(Decision).where(Decision.project_id == project))
                     player = await db.get(Player, (project, sid))
@@ -273,14 +270,14 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     profile["last_no_license"] = False
                 if outcome == "unknown_license":
                     profile["last_no_license"] = None
-                await deliver(sessions, client, project, settings, guard)
+                await deliver(sessions, client, project, settings)
                 async with sessions() as db:
                     row = await db.scalar(select(Decision).where(Decision.project_id == project))
                     assert row.state == "cancelled"
                 assert not submitted
                 return
             if outcome in {"missing_ip", "already_banned", "observe"}:
-                await deliver(sessions, client, project, settings, guard)
+                await deliver(sessions, client, project, settings)
                 expected = {
                     "missing_ip": "failed",
                     "already_banned": "superseded",
@@ -301,17 +298,32 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
 
                 http.event_hooks["request"].append(fail_before_send)
                 with pytest.raises(RustAppRequestNotSent):
-                    await deliver(sessions, client, project, settings, guard)
+                    await deliver(sessions, client, project, settings)
                 async with sessions() as db:
                     row = await db.scalar(select(Decision).where(Decision.project_id == project))
                     assert row.state == "pending"
                 assert submitted == []
                 return
+            if outcome == "pause_before_send":
+
+                async def disable_during_stats(request):
+                    if request.url.path.endswith("/stats"):
+                        async with sessions.begin() as db:
+                            await set_autoban(db, project, False)
+
+                http.event_hooks["request"].append(disable_during_stats)
+                await deliver(sessions, client, project, settings)
+                assert not submitted
+                async with sessions.begin() as db:
+                    row = await db.scalar(select(Decision).where(Decision.project_id == project))
+                    assert row.state == "pending"
+                    await set_autoban(db, project, True)
+                http.event_hooks["request"].remove(disable_during_stats)
             with pytest.raises(RustAppTimeoutError):
-                await deliver(sessions, client, project, settings, guard)
+                await deliver(sessions, client, project, settings)
             assert "Отправка бессрочного бана" in caplog.text
             assert "Блокировка подтверждена" not in caplog.text
-            await deliver(sessions, client, project, settings, guard)
+            await deliver(sessions, client, project, settings)
             async with sessions.begin() as db:
                 if outcome == "confirmed_after_exit":
                     await save_presence(db, project, {sid: "offline"}, (now + 1) * 1_000_000)
@@ -325,15 +337,12 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                 row = await db.scalar(select(Decision).where(Decision.project_id == project))
                 assert row.state == ("failed" if outcome == "wrong_ip" else "confirmed")
                 assert row.external_id == 789 and row.ban_ip == session_ip
-                assert (await db.get(ReferenceBan, (project, 789))).eligible == (
-                    outcome in {"confirmed", "confirmed_after_exit"}
-                )
-            assert len(submitted) == 1
+                reference = await db.get(ReferenceBan, (project, 789))
+                assert reference.eligible == (outcome != "wrong_ip")
+            assert len(submitted) == 1 and submitted[0]["reason"] == "Чит"
             assert submitted[0]["server_ids"] == [] and "expired_at" not in submitted[0]
             assert submitted[0]["ban_ip_active"] is True and submitted[0]["ban_ip"] == session_ip
-            assert ("Блокировка подтверждена RustApp" in caplog.text) == (
-                outcome in {"confirmed", "confirmed_after_exit"}
-            )
+            assert ("Блокировка подтверждена RustApp" in caplog.text) == (outcome != "wrong_ip")
             assert "паттерн=P05" in caplog.text and "жертв" in caplog.text and sid in caplog.text
             assert session_ip not in caplog.text
     finally:

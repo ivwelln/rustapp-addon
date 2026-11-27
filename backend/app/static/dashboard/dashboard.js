@@ -22,6 +22,7 @@ const rowMotion = {duration: 360, easing: "cubic-bezier(.22, 1, .36, 1)"};
 const rowContents = new WeakMap();
 let snapshot = null;
 let snapshotReceivedAt = 0;
+let autobanSaving = false;
 let activeTab = "players";
 let presenceFilter = "all";
 let lastTableKey = null;
@@ -424,6 +425,40 @@ function renderChart() {
 }
 
 
+function renderAutoban() {
+  const enabled = snapshot?.autoban_enabled;
+  const state = get("autoban-state");
+  const button = get("autoban-toggle");
+  state.textContent = enabled == null ? "…" : enabled ? "Включены" : "Выключены";
+  state.dataset.enabled = enabled ?? "";
+  button.textContent = autobanSaving ? "Сохраняем…" : enabled == null ? "Изменить"
+    : enabled ? "Выключить" : "Включить";
+  button.disabled = autobanSaving || enabled == null || get("connection").dataset.state !== "ok";
+}
+
+get("autoban-toggle").addEventListener("click", async () => {
+  const enabled = !snapshot.autoban_enabled;
+  const message = get("autoban-message");
+  autobanSaving = true;
+  message.hidden = true;
+  renderAutoban();
+  try {
+    const response = await fetch("/api/dashboard/autoban", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({enabled}),
+    });
+    if (!response.ok) throw new Error();
+    snapshot.autoban_enabled = (await response.json()).enabled;
+  } catch {
+    message.textContent = "Не удалось сохранить настройку. Проверьте состояние и повторите.";
+    message.hidden = false;
+  } finally {
+    autobanSaving = false;
+    renderAutoban();
+  }
+});
+
 function showSnapshot(data) {
   if (snapshot && data.updated_at < snapshot.updated_at) return;
   snapshot = data;
@@ -440,10 +475,6 @@ function showSnapshot(data) {
   get("stored-players").textContent = data.storage ? number.format(data.storage.players) : "—";
   get("stored-kills").textContent = data.storage ? number.format(data.storage.kills) : "—";
   get("project-meta").textContent = `Проект №${data.project}`;
-  get("guard").textContent = `${data.guard.used} / ${data.guard.limit}`;
-  const exhausted = data.guard.used >= data.guard.limit;
-  get("guard").dataset.limit = exhausted;
-  get("guard-status").textContent = exhausted ? "Достигнут аварийный лимит" : "Занято мест";
   get("updated").textContent = `Обновлено в ${clock.format(new Date(data.updated_at))}`;
   renderChart();
   renderActivity();
@@ -454,6 +485,7 @@ function setConnection(state, label, message = "") {
   get("connection-label").textContent = label;
   get("error").hidden = !message;
   get("error").textContent = message;
+  renderAutoban();
   if (!snapshot) renderActivity();
 }
 

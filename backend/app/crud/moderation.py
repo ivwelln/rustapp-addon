@@ -2,10 +2,12 @@ import logging
 from collections.abc import Iterable
 from time import time_ns
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
+from app.crud.moderation_control import autoban_enabled
 from app.crud.player_data import save_response
 from app.models.moderation import CollectionJob, CombatKill, Decision, Observation, ReferenceBan
 from app.models.player import Player
@@ -199,9 +201,7 @@ async def reference_bans(
     )
 
 
-async def save_decision(
-    db: AsyncSession, session: Session, matches: dict, *, enforce: bool
-) -> None:
+async def save_decision(db: AsyncSession, session: Session, matches: dict) -> None:
     if not matches:
         return
     decision = await db.scalar(
@@ -236,6 +236,7 @@ async def save_decision(
         decision.joined_at = session.joined_at
     decision.matches = {**matches, **previous}
     decision.primary_pattern, decision.action = outcome(decision.matches)
+    enforce = decision.action == "ban" and await autoban_enabled(db, session.project_id)
     if not enforce and decision.action == "ban" and decision.primary_pattern != previous_primary:
         await db.flush()
         logger.info(
@@ -261,3 +262,35 @@ async def save_decision(
             session.steam_id,
             decision.primary_pattern,
         )
+
+
+async def claim_ban(
+    db: AsyncSession, project: int, decision_id: int, pattern: str, ban_ip: str
+) -> bool:
+    # Serialize claims so a second worker cannot dispatch while the same player's PUT is unresolved.
+    await db.execute(select(func.pg_advisory_xact_lock(912_438, project)))
+    other = aliased(Decision)
+    in_flight = (
+        select(other.id)
+        .where(
+            other.project_id == project,
+            other.steam_id == Decision.steam_id,
+            other.state == "sending",
+        )
+        .exists()
+    )
+    claimed = await db.scalar(
+        update(Decision)
+        .where(
+            Decision.project_id == project,
+            Decision.id == decision_id,
+            Decision.state == "pending",
+            Decision.action == "ban",
+            Decision.primary_pattern == pattern,
+            Decision.ban_ip == ban_ip,
+            ~in_flight,
+        )
+        .values(state="sending")
+        .returning(Decision.id)
+    )
+    return claimed is not None

@@ -4,6 +4,7 @@ from app.models.moderation import (
     CombatDeath,
     CombatKill,
     Decision,
+    ModerationControl,
     Observation,
     ReferenceBan,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "CombatDeath",
     "CombatKill",
     "Decision",
+    "ModerationControl",
     "Observation",
     "ReferenceBan",
     "RustAppRequest",

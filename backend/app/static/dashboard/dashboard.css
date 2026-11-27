@@ -103,7 +103,7 @@ button, .rustapp-player-link { transition: transform 300ms var(--curve); }
 }
 .intro-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 12px; color: var(--muted); }
 .connection[data-state="ok"] { color: var(--accent); }
-.connection[data-state="error"], #decision-message[data-error="true"] { color: var(--error); }
+.connection[data-state="error"], #decision-message[data-error="true"], #autoban-message { color: var(--error); }
 .refresh { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--raised); }
 #save-verdict { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 .refresh:hover { filter: brightness(1.12); }
@@ -118,7 +118,10 @@ button, .rustapp-player-link { transition: transform 300ms var(--curve); }
 .metric h2 { font: 600 .75rem/1rem var(--font); color: var(--muted); }
 .metric strong, .traffic-total strong, .archive-totals dd, .report-count, .steam, .number { font-variant-numeric: tabular-nums; }
 #online-total { color: var(--accent); }
-.metric strong[data-limit="true"], .player-state[data-afk="true"] { color: var(--warning); }
+.metric strong[data-enabled="false"], .player-state[data-afk="true"] { color: var(--warning); }
+.metric strong[data-enabled="true"] { color: var(--accent); }
+#autoban-state { font: 600 1.25rem/1.75rem var(--font); }
+#autoban-toggle { padding: 4px 9px; }
 p, .metric p, .detail, .table-footer, .traffic-total span, .axis, .archive-totals dt, .rules-list dd { color: var(--muted); }
 .panel-head, .table-tools, .table-footer, .axis { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .activity .panel-head, .table-tools, .table-footer { padding: 12px 16px; }
