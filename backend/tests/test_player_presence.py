@@ -140,6 +140,8 @@ async def test_first_check_refreshes_annual_hours_before_combat(intake, monkeypa
 
     def reply(request):
         requests.append(request.url.path)
+        if request.url.path == f"/players/{steam_id}/details":
+            return httpx2.Response(200, json={"player": profile})
         assert request.url.path == f"/players/{steam_id}/stats"
         start = int(request.url.params["time_from"])
         end = int(request.url.params["time_to"])
@@ -200,7 +202,7 @@ async def test_first_check_refreshes_annual_hours_before_combat(intake, monkeypa
                 assert player.is_whitelisted and player.whitelist_reason == "playtime"
                 assert job.due_at is None
                 await collect(db, client, job, ModerationSettings())
-        assert requests == [f"/players/{steam_id}/stats"]
+        assert requests == [f"/players/{steam_id}/details", f"/players/{steam_id}/stats"]
     finally:
         await engine.dispose()
 

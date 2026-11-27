@@ -140,12 +140,16 @@ function rosterRow(record) {
   combat.title = record.priority ? "Вне белого списка: больше 5 убийств и меньше 2 смертей"
     : "Убийства и смерти за 24 часа по собранным данным";
   const hours = record.project_played_ms == null ? "—"
-    : (record.playtime_days < 365 ? "≥ " : "") + number.format(record.project_played_ms / 3600000);
+    : (record.playtime_lower_bound || record.playtime_days < 365 ? "≥ " : "")
+      + number.format(record.project_played_ms / 3600000);
   const playtime = element("td", hours, "number");
   const asOf = record.playtime_as_of && hours !== "—" ? new Date(record.playtime_as_of).toLocaleString("ru-RU") : null;
   playtime.title = asOf
-    ? `Часы RustApp по всем серверам проекта на ${asOf}. Данные за ${record.playtime_days} из 365 дней.`
+    ? `Часы RustApp по всем серверам проекта на ${asOf}.`
     : "Годовые часы RustApp пока неизвестны.";
+  if (record.active_session_ms != null) {
+    playtime.title += ` Текущая сессия по RustApp: ${number.format(record.active_session_ms / 3600000)} ч.`;
+  }
   if (record.trained) playtime.title += " Исследовательский срез готов.";
   row.append(identity, element("td", record.steam_id, "steam"), whitelist,
     valueCell(record.provider || null), country, playtime, combat);
@@ -193,6 +197,7 @@ function renderDecision(record) {
     body.append(factsList([
       ["Проверка допуска к бану", evidenceDate(check.checked_at)],
       ["Часы RustApp за 365 дней", check.project_ms == null ? "Недостаточно данных" : number.format(check.project_ms / 3600000)],
+      ["В том числе текущая сессия, ч", check.active_session_ms == null ? null : number.format(check.active_session_ms / 3600000)],
       ["Пиратский клиент подтверждён", check.pirated ? "Да" : null],
     ]));
   }

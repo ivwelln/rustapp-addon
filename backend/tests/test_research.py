@@ -17,6 +17,7 @@ from app.models import (
     CollectionJob,
     Player,
     PlayerPlaytime,
+    PlayerPresence,
     PlaytimeDay,
     ResearchCase,
     ResearchSource,
@@ -25,8 +26,22 @@ from app.models import (
 )
 from app.services.moderation.eligibility import annual_ms, hours_proof_is_current
 from app.services.research.cases import add_case, source_params, sync_cases
-from app.services.research.playtime import DAY, HOUR, cache_days, missing_range, refresh_hours
-from app.services.research.queue import claim_hours, claim_source, hydrate, store_work
+from app.services.research.playtime import (
+    DAY,
+    HOUR,
+    cache_days,
+    combined_playtime,
+    missing_range,
+    refresh_hours,
+    save_annual,
+)
+from app.services.research.queue import (
+    claim_hours,
+    claim_live_hours,
+    claim_source,
+    hydrate,
+    store_work,
+)
 from app.services.research.snapshots import Snapshot, prepare
 from app.workers.import_research import save_archived
 
@@ -35,6 +50,75 @@ SERVER = 163
 database = pytest.mark.skipif(
     not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL"
 )
+
+
+@database
+async def test_combined_history_and_live_time_qualifies_control_only_for_current_session():
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    project, now = uuid4().int % (2**30) + 1, now_ms()
+    start = now - 2 * HOUR
+    try:
+        async with sessions.begin() as db:
+            db.add(Player(project_id=project, steam_id=SID, last_client_kind="pirated"))
+            await confirm_presence_connection(db, project, now)
+            await save_presence(
+                db,
+                project,
+                {SID: "online"},
+                start * 1_000_000,
+                server_info={SID: (SERVER, True)},
+            )
+            await save_annual(db, project, SID, 19 * HOUR, now, before=start)
+            job = await claim_live_hours(db, project, SERVER, now)
+            assert job is not None and job.source == "details"
+            await store_work(
+                db,
+                project,
+                job,
+                {
+                    "player": {
+                        "project_id": project,
+                        "steam_id": SID,
+                        "created_at": start,
+                        "status": "online",
+                        "server_id": SERVER,
+                        "last_no_license": True,
+                    },
+                    "entity": {
+                        "connected_at": start,
+                        "seconds_connected": 7200,
+                        "server_id": SERVER,
+                    },
+                },
+                now,
+            )
+            await sync_cases(db, project, SERVER, now)
+            selected = await db.scalar(
+                select(ResearchCase).where(ResearchCase.project_id == project)
+            )
+            assert selected.qualifying_ms == 21 * HOUR
+            await save_presence(db, project, {SID: "offline"}, (now + 1) * 1_000_000)
+            await save_presence(
+                db,
+                project,
+                {SID: "online"},
+                (now + 2) * 1_000_000,
+                server_info={SID: (SERVER, True)},
+            )
+            query = (
+                select(combined_playtime(now + 2))
+                .select_from(PlayerPlaytime)
+                .join(
+                    PlayerPresence,
+                    (PlayerPresence.project_id == PlayerPlaytime.project_id)
+                    & (PlayerPresence.steam_id == PlayerPlaytime.steam_id),
+                )
+                .where(PlayerPlaytime.project_id == project)
+            )
+            assert await db.scalar(query) is None
+    finally:
+        await engine.dispose()
 
 
 def stats(start, end, hours=0):

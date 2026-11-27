@@ -1,13 +1,14 @@
 from decimal import Decimal
 from itertools import groupby
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.rustapp.exceptions import RustAppResponseError
-from app.models import Player, PlayerPlaytime, PlaytimeDay
-from app.services.moderation.playtime import YEAR_MS
+from app.crud.presence import PRESENCE_TIMEOUT_MS, PRESENT
+from app.models import Player, PlayerPlaytime, PlayerPresence, PlaytimeDay, PresenceHeartbeat
+from app.services.moderation.playtime import YEAR_MS, LivePlaytime
 
 DAY = 86_400_000
 HOUR = 3_600_000
@@ -15,19 +16,99 @@ CONTROL_MS = 20 * HOUR
 
 
 async def save_annual(
-    db: AsyncSession, project: int, sid: str, duration: int, checked_at: int
+    db: AsyncSession,
+    project: int,
+    sid: str,
+    duration: int,
+    checked_at: int,
+    *,
+    before: int | None = None,
 ) -> None:
-    statement = insert(PlayerPlaytime).values(
-        project_id=project, steam_id=sid, annual_ms=duration, annual_checked_at=checked_at
-    )
+    values = dict(annual_ms=duration, annual_checked_at=checked_at, annual_before=before)
+    statement = insert(PlayerPlaytime).values(project_id=project, steam_id=sid, **values)
     await db.execute(
         statement.on_conflict_do_update(
             index_elements=[PlayerPlaytime.project_id, PlayerPlaytime.steam_id],
-            set_={"annual_ms": duration, "annual_checked_at": checked_at},
+            set_=values,
             where=PlayerPlaytime.annual_checked_at.is_(None)
             | (PlayerPlaytime.annual_checked_at < checked_at),
         )
     )
+
+
+async def save_live_playtime(
+    db: AsyncSession, project: int, sid: str, live: LivePlaytime, presence: PlayerPresence
+) -> None:
+    values = dict(
+        live_started_at=live.started_at,
+        live_ms=live.duration,
+        live_checked_at=live.observed_at,
+        live_session_key=presence.session_key,
+        live_server_id=live.server_id,
+    )
+    statement = insert(PlayerPlaytime).values(project_id=project, steam_id=sid, **values)
+    await db.execute(
+        statement.on_conflict_do_update(
+            index_elements=[PlayerPlaytime.project_id, PlayerPlaytime.steam_id],
+            set_=values,
+            where=PlayerPlaytime.live_checked_at.is_(None)
+            | (PlayerPlaytime.live_checked_at < live.observed_at),
+        )
+    )
+
+
+def active_playtime(now: int):
+    active = (
+        PlayerPresence.status.in_(PRESENT)
+        & (PlayerPresence.server_id == PlayerPlaytime.live_server_id)
+        & (
+            func.coalesce(PlayerPresence.connecting_at, PlayerPresence.active_since)
+            == PlayerPlaytime.live_session_key
+        )
+        & (PlayerPlaytime.live_checked_at >= PlayerPresence.active_since)
+        & select(PresenceHeartbeat.project_id)
+        .where(
+            PresenceHeartbeat.project_id == PlayerPlaytime.project_id,
+            PresenceHeartbeat.confirmed_at.between(now - PRESENCE_TIMEOUT_MS, now),
+        )
+        .correlate(PlayerPlaytime)
+        .exists()
+    )
+    start = PlayerPlaytime.live_started_at
+    duration = func.greatest(
+        0, start + PlayerPlaytime.live_ms - func.greatest(start, now - YEAR_MS)
+    )
+    return case((active, duration))
+
+
+def cached_day_total(now: int, before):
+    return (
+        select(func.sum(PlaytimeDay.played_ms))
+        .where(
+            PlaytimeDay.project_id == PlayerPlaytime.project_id,
+            PlaytimeDay.steam_id == PlayerPlaytime.steam_id,
+            PlaytimeDay.day >= now - YEAR_MS,
+            PlaytimeDay.day + DAY <= before,
+        )
+        .correlate(PlayerPlaytime)
+        .scalar_subquery()
+    )
+
+
+def combined_playtime(now: int):
+    live = active_playtime(now)
+    base = func.greatest(
+        cached_day_total(now, PlayerPlaytime.live_started_at),
+        case(
+            (
+                func.coalesce(PlayerPlaytime.annual_before, PlayerPlaytime.annual_checked_at)
+                <= PlayerPlaytime.live_started_at,
+                PlayerPlaytime.annual_ms - func.greatest(0, now - PlayerPlaytime.annual_checked_at),
+            )
+        ),
+        0,
+    )
+    return live + base
 
 
 def daily_playtime(payload: dict, sid: str) -> dict[int, int]:

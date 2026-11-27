@@ -13,6 +13,7 @@ from app.models import (
     PlayerPresence,
     PlayerReport,
 )
+from app.services.research.playtime import active_playtime, combined_playtime
 
 DAY_MS = 24 * 60 * 60 * 1000
 STEAM_AVATAR_HOSTS = (
@@ -88,6 +89,10 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
         (PlayerPlaytime.project_days < 365)
         | (PlayerPlaytime.annual_checked_at >= func.coalesce(PlayerPlaytime.project_day_end, 0))
     )
+    historical = case((use_annual, PlayerPlaytime.annual_ms), else_=PlayerPlaytime.project_ms)
+    combined = combined_playtime(now_ms)
+    live = active_playtime(now_ms)
+    show_combined = combined.is_not(None) & (combined >= func.coalesce(historical, 0))
     last_feed_at = PlayerData.responses["kill-feed"]["observed_at"].astext.cast(BigInteger)
     known_zero = case((last_feed_at.between(recent, now_ms), 0))
     kill_count = func.coalesce(kills.c.count, known_zero)
@@ -126,11 +131,17 @@ async def online_players(db: AsyncSession, project: int, now_ms: int) -> list[di
                 profile_field("ip_details", "country_name").label("country_name"),
                 kill_count.label("kills"),
                 death_count.label("deaths"),
-                case((use_annual, PlayerPlaytime.annual_ms), else_=PlayerPlaytime.project_ms).label(
-                    "project_played_ms"
-                ),
-                case((use_annual, 365), else_=PlayerPlaytime.project_days).label("playtime_days"),
+                func.greatest(historical, combined).label("project_played_ms"),
                 case(
+                    (use_annual & PlayerPlaytime.annual_before.is_(None), 365),
+                    else_=PlayerPlaytime.project_days,
+                ).label("playtime_days"),
+                (show_combined | (use_annual & PlayerPlaytime.annual_before.is_not(None))).label(
+                    "playtime_lower_bound"
+                ),
+                live.label("active_session_ms"),
+                case(
+                    (show_combined, PlayerPlaytime.live_checked_at),
                     (use_annual, PlayerPlaytime.annual_checked_at),
                     else_=PlayerPlaytime.project_day_end,
                 ).label("playtime_as_of"),

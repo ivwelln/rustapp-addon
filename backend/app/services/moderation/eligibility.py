@@ -9,13 +9,15 @@ from app.clients.rustapp.moderation import read
 from app.crud.moderation import archive, now_ms
 from app.crud.players import whitelist_for_playtime
 from app.models import Decision, PlaytimeDay
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, YEAR_MS
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, YEAR_MS, LivePlaytime
 from app.services.research.playtime import DAY, HOUR, cache_days, daily_playtime, save_annual
 
 logger = logging.getLogger(__name__)
 
 
-async def cached_project_ms(db: AsyncSession, project: int, sid: str, now: int) -> int:
+async def cached_project_ms(
+    db: AsyncSession, project: int, sid: str, now: int, *, before: int | None = None
+) -> int:
     # A partial cache can prove that the player is protected; it cannot clear them for a ban.
     return int(
         await db.scalar(
@@ -23,7 +25,7 @@ async def cached_project_ms(db: AsyncSession, project: int, sid: str, now: int) 
                 PlaytimeDay.project_id == project,
                 PlaytimeDay.steam_id == sid,
                 PlaytimeDay.day >= now - YEAR_MS,
-                PlaytimeDay.day + DAY <= now,
+                PlaytimeDay.day + DAY <= (now if before is None else before),
             )
         )
         or 0
@@ -55,18 +57,26 @@ def hours_proof_is_current(proof: dict | None, now: int) -> bool:
     return 0 <= elapsed <= 30_000 and duration + elapsed < WHITELIST_PLAYTIME_MS
 
 
-async def verify_ban_hours(db: AsyncSession, client: RustAppClient, decision: Decision) -> bool:
-    project, sid, end = decision.project_id, decision.steam_id, now_ms()
-    params = {"time_from": end - YEAR_MS + 1, "time_to": end}
-    # Always get a fresh upper bound including today immediately before authorizing a ban.
+async def verify_ban_hours(
+    db: AsyncSession, client: RustAppClient, decision: Decision, live: LivePlaytime | None
+) -> bool:
+    project, sid, checked_at = decision.project_id, decision.steam_id, now_ms()
+    live_ms = live.within_year(checked_at) if live else 0
+    params = {
+        "time_from": checked_at - YEAR_MS + 1,
+        "time_to": live.started_at - 1 if live else checked_at,
+    }
+    if live_ms >= WHITELIST_PLAYTIME_MS:
+        return await record_ban_hours(db, decision, live, live_ms, live_ms, params)
+    # End before the active connection so later updates cannot count its time twice.
     try:
         raw = await read(client, f"/players/{sid}/stats", **params)
-        duration = annual_ms(raw, sid, params["time_from"], end)
+        duration = annual_ms(raw, sid, params["time_from"], params["time_to"])
     except RustAppHTTPError as exc:
         if exc.status_code not in (400, 404, 422):
             raise
         decision.eligibility = {
-            "checked_at": end,
+            "checked_at": checked_at,
             "outcome": "stats_unavailable",
             "http_status": exc.status_code,
             **params,
@@ -77,27 +87,48 @@ async def verify_ban_hours(db: AsyncSession, client: RustAppClient, decision: De
         )
         return False
     except (RustAppResponseError, ValueError):
-        decision.eligibility = {"checked_at": end, "outcome": "incomplete_stats", **params}
+        decision.eligibility = {"checked_at": checked_at, "outcome": "incomplete_stats", **params}
         decision.state = "cancelled"
         logger.warning("Бан отменён: годовые часы не подтверждены | SteamID=%s", sid)
         return False
     await archive(db, project, sid, "research-stats-window", {"params": params, "response": raw})
     await cache_days(db, project, sid, raw, params, now_ms())
-    await save_annual(db, project, sid, duration, end)
-    protected = duration >= WHITELIST_PLAYTIME_MS
+    await save_annual(
+        db, project, sid, duration, checked_at, before=live.started_at if live else None
+    )
+    return await record_ban_hours(db, decision, live, duration + live_ms, live_ms, params)
+
+
+async def record_ban_hours(
+    db: AsyncSession,
+    decision: Decision,
+    live: LivePlaytime | None,
+    total: int,
+    live_ms: int,
+    params: dict,
+) -> bool:
+    protected = total >= WHITELIST_PLAYTIME_MS
     decision.eligibility = {
-        "checked_at": end,
+        "checked_at": live.observed_at if live else now_ms(),
         "pirated": True,
-        "project_ms": duration,
-        "outcome": "protected" if protected else "eligible",
+        "project_ms": total,
+        "active_session_ms": live_ms if live else None,
+        "outcome": "protected" if protected else "eligible" if live else "session_unavailable",
         **params,
     }
     if protected:
-        await whitelist_for_playtime(db, project, sid)
-        decision.state = "cancelled"
+        await whitelist_for_playtime(db, decision.project_id, decision.steam_id)
         logger.info(
             "Бан отменён: белый список по часам RustApp | SteamID=%s часы=%.2f",
-            sid,
-            duration / HOUR,
+            decision.steam_id,
+            total / HOUR,
         )
-    return not protected
+    elif live is None:
+        logger.info(
+            "Бан отменён: RustApp не подтвердил длительность текущей сессии | SteamID=%s",
+            decision.steam_id,
+        )
+    else:
+        return True
+    decision.state = "cancelled"
+    return False

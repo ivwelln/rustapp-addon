@@ -8,13 +8,14 @@ from app.models import (
     Decision,
     Player,
     PlayerPlaytime,
+    PlayerPresence,
     PlaytimeDay,
     ReferenceBan,
     ResearchCase,
     ResearchSource,
 )
 from app.services.moderation.kill_feed import PAGE_LIMIT
-from app.services.research.playtime import CONTROL_MS, DAY
+from app.services.research.playtime import CONTROL_MS, DAY, combined_playtime
 
 VERSION = 1
 COMBAT_WINDOW = 30 * 60_000
@@ -213,13 +214,19 @@ async def sync_cases(db: AsyncSession, project: int, server: int, now: int) -> N
         & (PlayerPlaytime.annual_ms > CONTROL_MS)
         & (PlayerPlaytime.annual_checked_at >= func.coalesce(ResearchCase.cutoff_at, 0))
     )
+    active_project = combined_playtime(now)
     controls = await db.execute(
-        select(PlayerPlaytime, ResearchCase, verified_project, recent_annual)
+        select(PlayerPlaytime, ResearchCase, verified_project, recent_annual, active_project)
         .select_from(PlayerPlaytime)
         .join(
             Player,
             (Player.project_id == PlayerPlaytime.project_id)
             & (Player.steam_id == PlayerPlaytime.steam_id),
+        )
+        .outerjoin(
+            PlayerPresence,
+            (PlayerPresence.project_id == PlayerPlaytime.project_id)
+            & (PlayerPresence.steam_id == PlayerPlaytime.steam_id),
         )
         .outerjoin(
             ResearchCase,
@@ -233,15 +240,19 @@ async def sync_cases(db: AsyncSession, project: int, server: int, now: int) -> N
             PlayerPlaytime.project_id == project,
             Player.last_client_kind == "pirated",
             recent_annual
-            | ((PlayerPlaytime.project_ms > CONTROL_MS) & (verified_project > CONTROL_MS)),
+            | ((PlayerPlaytime.project_ms > CONTROL_MS) & (verified_project > CONTROL_MS))
+            | (active_project > CONTROL_MS),
             ResearchCase.id.is_(None) | (ResearchCase.label == "awaiting_playtime"),
             ~has_ban(PlayerPlaytime.steam_id),
         )
         .limit(64)
     )
-    for player, previous_case, project_ms, use_annual in controls:
-        selected_at = player.annual_checked_at if use_annual else now
-        qualifying_ms = player.annual_ms if use_annual else int(project_ms)
+    for player, previous_case, project_ms, use_annual, with_session in controls:
+        selected_at = now
+        qualifying_ms = max(int(project_ms or 0), with_session or 0)
+        if use_annual and player.annual_ms >= qualifying_ms:
+            selected_at = player.annual_checked_at
+            qualifying_ms = player.annual_ms
         if previous_case is not None:
             previous_case.hours_source = "rustapp"
             previous_case.qualifying_ms = qualifying_ms

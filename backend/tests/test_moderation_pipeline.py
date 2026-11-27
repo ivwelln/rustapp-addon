@@ -47,6 +47,9 @@ from app.services.moderation.collect import collect
         "unknown_license",
         "three_hours",
         "protected_on_join",
+        "live_only",
+        "combined_three_hours",
+        "missing_live_hours",
         "protected_on_recheck",
         "long_playtime",
         "incomplete_year",
@@ -60,7 +63,7 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
     project = uuid4().int % (2**30) + 1
     sid = "76561198000000000"
     now = now_ms()
-    start = now - 100_000
+    start = now - (10_801_000 if outcome == "live_only" else 100_000)
     profile = dict(
         project_id=project,
         steam_id=sid,
@@ -121,18 +124,33 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
             raise httpx2.ReadTimeout("Response lost", request=req)
         if path.endswith("/details"):
             data = {"player": profile}
+            if not (before_delivery and outcome == "missing_live_hours"):
+                seconds = {"live_only": 10_800, "combined_three_hours": 100}.get(outcome, 0)
+                data["entity"] = {
+                    "connected_at": start,
+                    "server_id": profile["server_id"],
+                    "seconds_connected": seconds
+                    if before_delivery or outcome == "live_only"
+                    else 0,
+                }
         elif path.endswith("/checks"):
             data = {"total": 5, "results": [{"private": "omit"}]}
         elif path.endswith("/stats"):
             start_at = int(req.url.params["time_from"])
             end_at = int(req.url.params["time_to"])
+            if not (before_delivery and outcome == "missing_live_hours"):
+                assert end_at == start - 1
             day_ms = 86_400_000
             buckets = {
                 str(day): {"date": day, "hours_played": 0}
                 for day in range(start_at // day_ms * day_ms, end_at + 1, day_ms)
             }
             hours = (
-                {"three_hours": 3, "long_playtime": 21.67}.get(outcome, 0) if before_delivery else 0
+                {"three_hours": 3, "long_playtime": 21.67, "combined_three_hours": 2.98}.get(
+                    outcome, 0
+                )
+                if before_delivery
+                else 0
             )
             if outcome == "protected_on_join":
                 hours = 21.67
@@ -180,7 +198,7 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                 async with sessions.begin() as db:
                     job = await db.get(CollectionJob, (project, sid), with_for_update=True)
                     await collect(db, client, job, settings)
-            if outcome == "protected_on_join":
+            if outcome in {"protected_on_join", "live_only"}:
                 async with sessions() as db:
                     assert (await db.get(Player, (project, sid))).is_whitelisted
                     assert not await db.scalar(
@@ -189,6 +207,8 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     job = await db.get(CollectionJob, (project, sid))
                     assert job.due_at is None
                 assert f"/players/{sid}/kill-feed" not in requests
+                if outcome == "live_only":
+                    assert requests == [f"/players/{sid}/details"]
                 assert not submitted
                 return
             if outcome == "protected_on_recheck":
@@ -206,7 +226,7 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     assert cache.annual_ms == 10_800_000
                     assert (await db.get(Player, (project, sid))).is_whitelisted
                     assert job.due_at is None
-                    assert requests == [f"/players/{sid}/stats"]
+                    assert requests == [f"/players/{sid}/details", f"/players/{sid}/stats"]
                 return
             async with sessions.begin() as db:
                 row = (
@@ -241,16 +261,27 @@ async def test_join_archive_decide_and_reconcile_timeout(outcome, caplog):
                     await deliver(sessions, client, project, settings)
                 assert not submitted
                 return
-            if outcome in {"three_hours", "long_playtime", "incomplete_year"}:
+            if outcome in {
+                "three_hours",
+                "long_playtime",
+                "incomplete_year",
+                "combined_three_hours",
+                "missing_live_hours",
+            }:
                 await deliver(sessions, client, project, settings)
                 async with sessions() as db:
                     row = await db.scalar(select(Decision).where(Decision.project_id == project))
                     player = await db.get(Player, (project, sid))
                     assert row.state == "cancelled"
-                    assert player.is_whitelisted == (outcome != "incomplete_year")
-                    assert row.eligibility["outcome"] == (
-                        "incomplete_stats" if outcome == "incomplete_year" else "protected"
-                    )
+                    failure = {
+                        "incomplete_year": "incomplete_stats",
+                        "missing_live_hours": "session_unavailable",
+                    }.get(outcome)
+                    assert player.is_whitelisted == (failure is None)
+                    assert row.eligibility["outcome"] == (failure or "protected")
+                    if outcome == "combined_three_hours":
+                        assert row.eligibility["active_session_ms"] == 100_000
+                        assert row.eligibility["project_ms"] == 2.98 * 3_600_000 + 100_000
                 assert not submitted
                 return
             if outcome in {"new_session", "other_server", "became_licensed", "unknown_license"}:
@@ -631,17 +662,17 @@ async def test_whitelist_stops_player_requests(trust_reason):
                     requests.clear()
                     await collect(db, RustAppClient(http), job, ModerationSettings())
                     assert requests == ["kill-feed"]
-                    # A new entry rechecks annual hours while short-lived detail data stays cached.
+                    # A new entry checks /details before selecting the annual stats window.
                     job.requested_at = now_ms() + 100
                     requests.clear()
                     await collect(db, RustAppClient(http), job, ModerationSettings())
-                    assert requests == ["stats", "kill-feed"]
+                    assert requests == ["details", "stats", "kill-feed"]
                 else:
                     assert player.is_whitelisted and job.due_at is None
                     assert player.whitelist_reason == "license"
                     expected_requests = {
                         "snapshot_license": [],
-                        "profile_license": ["stats", "details"],
+                        "profile_license": ["details"],
                     }
                     assert requests == expected_requests[trust_reason]
                     await enqueue(db, project, [steam_id], seed=False)

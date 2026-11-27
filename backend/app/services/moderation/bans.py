@@ -36,7 +36,7 @@ from app.services.moderation.eligibility import (
 )
 from app.services.moderation.evaluate import PRIORITY, describe
 from app.services.moderation.facts import MINUTE
-from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS
+from app.services.moderation.playtime import WHITELIST_PLAYTIME_MS, live_playtime
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +311,7 @@ async def deliver(
             return
         profile_observed_at = time_ns()
         profile, details = await fetch_profile(client, project, sid)
+        hours_observed_at = now_ms()
         if (
             await cache_profile(db, project, sid, details)
             or profile.last_no_license is not True
@@ -386,6 +387,7 @@ async def deliver(
         # if the earlier profile is no longer recent, before claiming the decision.
         if time_ns() - profile_observed_at > 10_000_000_000:
             profile, details = await fetch_profile(client, project, sid)
+            hours_observed_at = now_ms()
             if (
                 await cache_profile(db, project, sid, details)
                 or profile.last_no_license is not True
@@ -395,7 +397,10 @@ async def deliver(
             ):
                 row.state = "cancelled"
                 return
-        if not await verify_ban_hours(db, client, row):
+        live = live_playtime(details, hours_observed_at)
+        if live is not None and not live.matches(current):
+            live = None
+        if not await verify_ban_hours(db, client, row, live):
             return
         row.ban_ip = target_ip
         body = {
