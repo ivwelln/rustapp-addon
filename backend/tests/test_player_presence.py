@@ -14,15 +14,83 @@ from app.clients.rustapp.client import RustAppClient, create_rustapp_http_client
 from app.clients.rustapp.exceptions import RustAppTransportError
 from app.core.config import ModerationSettings, Settings
 from app.crud.moderation import archive, enqueue, now_ms
-from app.crud.presence import confirm_presence_connection, is_afk, player_is_afk, player_is_online
-from app.models import CollectionJob, ObservedPlay, Player, PlayerPresence
+from app.crud.presence import (
+    confirm_presence_connection,
+    is_afk,
+    player_is_afk,
+    player_is_online,
+    save_presence,
+)
+from app.models import CollectionJob, ObservedPlay, Player, PlayerPresence, PlayerReport
 from app.schemas.rustapp.players import RustAppPlayer
 from app.services.moderation.collect import collect
 from app.services.moderation.playtime import YEAR_MS
 from app.services.research.playtime import DAY
 from app.services.rustapp.player_sessions import PlayerSessionTracker
 from app.workers import listen_player_status
-from app.workers.listen_player_status import PlayerStatusEvents
+from app.workers.listen_player_status import PlayerStatusEvents, ReportEvents
+
+
+@pytest.mark.skipif(not os.getenv("MODERATION_TEST_DB_URL"), reason="Требуется тестовая PostgreSQL")
+async def test_report_publication_prioritizes_only_present_players_outside_whitelist(monkeypatch):
+    engine = create_async_engine(os.environ["MODERATION_TEST_DB_URL"])
+    sessions = async_sessionmaker(engine)
+    project = uuid4().int % (2**30) + 1
+    online, afk, trusted, offline = [str(76561198000000000 + index) for index in range(4)]
+    at = now_ms()
+    monkeypatch.setattr("app.crud.moderation.now_ms", lambda: at)
+    handler = ReportEvents(sessions, project)
+
+    async def publish(report_id: int, steam_id: str, report_project: int = project) -> None:
+        payload = {
+            "id": report_id,
+            "project_id": report_project,
+            "created_at": at,
+            "target": {"steam_id": steam_id},
+        }
+        await handler.on_publication(SimpleNamespace(pub=SimpleNamespace(data=payload)))
+
+    try:
+        async with sessions.begin() as db:
+            db.add(Player(project_id=project, steam_id=trusted, is_whitelisted=True))
+            await save_presence(
+                db,
+                project,
+                {online: "online", afk: "afk", trusted: "online", offline: "offline"},
+                at * 1_000_000,
+            )
+            db.add(
+                CollectionJob(
+                    project_id=project,
+                    steam_id=online,
+                    requested_at=at - 60_000,
+                    collected_at=at - 30_000,
+                    due_at=at + 120_000,
+                )
+            )
+
+        await publish(1, online, project + 1)
+        for report_id, steam_id in enumerate((online, afk, trusted, offline), start=1):
+            await publish(report_id, steam_id)
+
+        async with sessions.begin() as db:
+            job = await db.get(CollectionJob, (project, online))
+            assert job.report_pending and job.due_at == at
+            assert job.requested_at == at - 60_000
+            assert (await db.get(PlayerReport, (project, 1))).payload["target_steam_id"] == online
+            assert (await db.get(CollectionJob, (project, afk))).report_pending
+            assert not await db.scalar(select(player_is_online(project, afk)))
+            for steam_id in (trusted, offline):
+                assert await db.get(CollectionJob, (project, steam_id)) is None
+            job.report_pending = False
+            job.due_at = at + 150_000
+
+        await publish(1, online)
+        async with sessions() as db:
+            job = await db.get(CollectionJob, (project, online))
+            assert not job.report_pending and job.due_at == at + 150_000
+    finally:
+        await engine.dispose()
 
 
 def test_online_after_afk_is_not_a_new_connection():

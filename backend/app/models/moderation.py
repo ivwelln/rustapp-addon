@@ -12,6 +12,7 @@ class CollectionJob(Base):
     requested_at: Mapped[int] = mapped_column(BigInteger)
     collected_at: Mapped[int | None] = mapped_column(BigInteger)
     due_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    report_pending: Mapped[bool] = mapped_column(server_default="false")
     playtime_due_at: Mapped[int | None] = mapped_column(BigInteger)
     kill_feed_covered_from: Mapped[int | None] = mapped_column(BigInteger)
     kill_feed_covered_through: Mapped[int | None] = mapped_column(BigInteger)

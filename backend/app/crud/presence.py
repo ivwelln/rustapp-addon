@@ -71,7 +71,7 @@ async def remove_offline_jobs(db: AsyncSession, project: int, observed_at: int) 
             CollectionJob.steam_id.in_(offline),
             CollectionJob.due_at.is_not(None),
         )
-        .values(due_at=None)
+        .values(due_at=None, report_pending=False)
     )
 
 

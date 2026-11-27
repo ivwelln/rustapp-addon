@@ -139,6 +139,7 @@ async def run() -> None:
                                 player_is_online(CollectionJob.project_id, CollectionJob.steam_id),
                             )
                             .order_by(
+                                CollectionJob.report_pending.desc(),
                                 (
                                     CollectionJob.collected_at.is_(None)
                                     | (CollectionJob.requested_at > CollectionJob.collected_at)
