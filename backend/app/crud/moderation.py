@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.crud.player_data import save_response
 from app.models.moderation import CollectionJob, CombatKill, Decision, Observation, ReferenceBan
 from app.models.player import Player
+from app.models.player_data import PlayerPresence, PlayerReport
 from app.services.moderation.evaluate import describe, outcome
 from app.services.moderation.facts import MINUTE, Ban, Kill, Patterns, Session
 
@@ -56,6 +57,49 @@ async def enqueue(db: AsyncSession, project: int, players: Iterable[str], *, see
         where=CollectionJob.due_at.is_(None) if seed else CollectionJob.requested_at < at,
     )
     await db.execute(stmt)
+
+
+async def enqueue_report(db: AsyncSession, project: int, steam_id: str, report: dict) -> bool:
+    present = await db.scalar(
+        select(PlayerPresence.steam_id).where(
+            PlayerPresence.project_id == project,
+            PlayerPresence.steam_id == steam_id,
+            PlayerPresence.status.in_(("online", "afk")),
+            ~select(Player.steam_id)
+            .where(Player.project_id == project, Player.steam_id == steam_id, Player.is_whitelisted)
+            .exists(),
+        )
+    )
+    if present is None:
+        return False
+
+    # The moderation worker also locks the job before writing reports.
+    at = now_ms()
+    await db.execute(
+        insert(CollectionJob)
+        .values(project_id=project, steam_id=steam_id, requested_at=at)
+        .on_conflict_do_nothing()
+    )
+    job = await db.get(CollectionJob, (project, steam_id), with_for_update=True)
+    inserted = await db.scalar(
+        insert(PlayerReport)
+        .values(
+            project_id=project,
+            report_id=report["id"],
+            steam_id=steam_id,
+            created_at=report["created_at"],
+            payload=report,
+        )
+        .on_conflict_do_nothing()
+        .returning(PlayerReport.report_id)
+    )
+    if inserted is None:
+        return False
+
+    if not job.report_pending:
+        job.due_at = at if job.due_at is None else min(at, job.due_at)
+        job.report_pending = True
+    return True
 
 
 async def latest(db: AsyncSession, project: int, sid: str, source: str) -> Observation | None:

@@ -13,6 +13,7 @@ from centrifuge import (
     PublicationContext,
     SubscribedContext,
     SubscribingContext,
+    SubscriptionErrorContext,
     SubscriptionEventHandler,
     UnauthorizedError,
     UnsubscribedContext,
@@ -29,12 +30,13 @@ from app.clients.rustapp.client import (
 )
 from app.clients.rustapp.exceptions import RustAppError, RustAppHTTPError, RustAppResponseError
 from app.clients.rustapp.handshake import fetch_centrifugo_token
+from app.clients.rustapp.moderation import is_player
 from app.clients.rustapp.players import fetch_players_page
 from app.clients.rustapp.realtime import RustAppRealtimeClient
 from app.clients.rustapp.retry_after import parse_retry_after
 from app.core.config import DatabaseSettings, get_settings
 from app.core.logging import configure_console_logging
-from app.crud.moderation import enqueue
+from app.crud.moderation import enqueue, enqueue_report
 from app.crud.presence import (
     PRESENCE_TIMEOUT_MS,
     confirm_presence_connection,
@@ -45,7 +47,11 @@ from app.crud.presence import (
 from app.crud.rustapp_requests import account_key
 from app.db.session import open_database_sessions
 from app.schemas.rustapp.players import MAX_PLAYERS_PAGE_SIZE, RustAppPlayer
-from app.schemas.rustapp.realtime import PlayerStatus, RustAppPlayerStatusUpdate
+from app.schemas.rustapp.realtime import (
+    PlayerStatus,
+    RustAppPlayerStatusUpdate,
+    RustAppReportPublication,
+)
 from app.services.rustapp.player_sessions import PlayerSessionTracker
 from app.services.rustapp.player_snapshots import save_player_snapshot
 
@@ -340,6 +346,42 @@ class PlayerStatusEvents(SubscriptionEventHandler):
             logger.info("Подтверждён заход  |  SteamID:  %s", steam_id)
 
 
+class ReportEvents(SubscriptionEventHandler):
+    def __init__(self, db_sessions: async_sessionmaker[AsyncSession], project_id: int) -> None:
+        self._db_sessions = db_sessions
+        self._project_id = project_id
+
+    async def on_subscribed(self, ctx: SubscribedContext) -> None:
+        logger.info("Подписка на репорты активна: %s", ctx.channel)
+
+    async def on_error(self, ctx: SubscriptionErrorContext) -> None:
+        logger.warning("Ошибка подписки на репорты (%s)", type(ctx.error).__name__)
+
+    async def on_unsubscribed(self, ctx: UnsubscribedContext) -> None:
+        logger.warning("Подписка на репорты завершилась: %d", ctx.code)
+
+    async def on_publication(self, ctx: PublicationContext) -> None:
+        try:
+            report = RustAppReportPublication.model_validate(ctx.pub.data)
+        except ValidationError:
+            logger.warning("Неизвестный формат публикации репорта")
+            return
+        steam_id = report.target.steam_id
+        if not is_player(steam_id) or report.project_id not in (None, self._project_id):
+            return
+        payload = {**ctx.pub.data, "target_steam_id": steam_id}
+        try:
+            async with self._db_sessions.begin() as db:
+                queued = await enqueue_report(db, self._project_id, steam_id, payload)
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Не удалось обработать репорт в PostgreSQL (%s)", type(exc).__name__)
+            return
+        if queued:
+            logger.info(
+                "Репорт поставил игрока на проверку | SteamID=%s репорт=%d", steam_id, report.id
+            )
+
+
 async def run_listener() -> int:
     try:
         settings = get_settings()
@@ -420,12 +462,17 @@ async def run_listener() -> int:
             tasks=tasks,
         )
         subscription = client.new_subscription(channel, events=status_events)
+        reports = client.new_subscription(
+            f"project:server-report/{settings.rustapp_project_id}",
+            events=ReportEvents(db_sessions, settings.rustapp_project_id),
+        )
         heartbeat = tasks.create_task(status_events.monitor_connection(client))
 
         try:
             await client.connect()
             if not stopped.is_set():
                 await subscription.subscribe()
+                await reports.subscribe()
                 await stopped.wait()
         except CentrifugeError as exc:
             logger.error("Слушатель RustApp завершился: %s", type(exc).__name__)

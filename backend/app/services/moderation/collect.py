@@ -114,6 +114,7 @@ async def collect(
     project, sid = job.project_id, job.steam_id
     if await whitelisted(db, project, sid, lock=True):
         job.due_at = None
+        job.report_pending = False
         logger.debug("Модерация: пропуск по белому списку | SteamID=%s", sid)
         return
 
@@ -132,6 +133,7 @@ async def collect(
     if presence.status != "online":
         return
     active_since = presence.active_since
+    job.report_pending = False
     previous = job.collected_at
     fresh = previous is None or job.requested_at > previous or active_since > previous
     if fresh or job.playtime_due_at is None or job.playtime_due_at <= now:
